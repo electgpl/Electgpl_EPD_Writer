@@ -13,8 +13,9 @@
  *  Sketch files: this .ino + spleen_fonts.h + wallpaper_builtin.h (same folder)
  *
  *  DESKTOP (boot screen)
- *    PDA-style menu over a wallpaper: Continue writing, New document,
- *    Documents, File transfer, Settings, Help, Lock. Arrows + Enter or 1-7.
+ *    PDA-style menu over a wallpaper: Continue writing (Read document without
+ *    keyboard), New document, Documents, File transfer, Settings, Help and
+ *    Private: unlock/lock. Arrows + Enter, keys 1-7, or the side buttons.
  *    Esc in the editor returns to the desktop.
  *
  *  STORAGE
@@ -23,21 +24,27 @@
  *    keystroke. The last document and cursor are restored per volume.
  *
  *  SETTINGS
- *    Password (privacy lock), auto-lock, keyboard layout, storage volume,
+ *    Password, auto-hide of private documents, keyboard layout, storage volume,
  *    copy all documents to the other volume, wallpaper, forget keyboard.
- *    The password is a privacy lock (salted SHA-256 in NVS), NOT encryption.
- *    Recovery: hold MENU + EXIT while powering up to clear it.
+ *
+ *  PRIVATE DOCUMENTS (Casio organizer style "secret area")
+ *    Documents moved to /secret with P in the file list are only listed after
+ *    the password is entered (desktop item 7); public ones never ask for it.
+ *    Privacy only (salted SHA-256 in NVS), NOT encryption. Recovery: hold
+ *    MENU + EXIT while powering up to clear the password.
  *
  *  KEYBOARD SHORTCUTS (Ctrl+H shows them on screen)
  *    Ctrl+S save              Ctrl+O file list           Ctrl+N new document
  *    Ctrl+W file transfer     Ctrl+R anti-ghost refresh  Ctrl+H help
- *    Ctrl+L lock              Ctrl+Home / Ctrl+End  start / end of document
+ *    Ctrl+L hide private      Ctrl+P preview / view      Ctrl+Home/End  doc ends
  *    Esc    desktop (or cancel a pending dead key)
  *  FILE LIST
- *    Up/Down select   Enter open   N new   R rename   D or Del delete   Esc back
- *  BOARD BUTTONS
- *    EXIT = desktop   MENU = full refresh   OK = save   UP/DOWN = page up/down
- *    EXIT held 3 s = delete bonds (pair the keyboard again)
+ *    Up/Down select  Enter open  N new  R rename  D/Del delete  P private  Esc back
+ *  SIDE BUTTONS (keyboard-less "pocket PDA" viewer)
+ *    UP/DOWN move in lists, page in the editor/viewer (auto-repeat when held)
+ *    OK select (in the editor: save)   EXIT back   BOOT desktop   MENU refresh
+ *    EXIT held 3 s = delete bonds (pair the keyboard again). Documents opened
+ *    with a button, or with no keyboard linked, open in the read-only viewer.
  *
  *  FILE TRANSFER (Ctrl+W)
  *    The ESP32-S3 becomes a WiFi hotspot "Electgpl-Writer" (pass electgpl1234).
@@ -107,7 +114,7 @@ typedef struct {             // one display line of the Markdown preview
   uint8_t  kind, indent, depth;
 } mdline_t;
 enum { WALL_BUILTIN = 0, WALL_FILE = 1, WALL_NONE = 2 };
-enum { IN_PW_OLD = 0, IN_PW_NEW1, IN_PW_NEW2 };
+enum { IN_PW_OLD = 0, IN_PW_NEW1, IN_PW_NEW2, IN_UNLOCK };
 enum { WF_OFF = 0, WF_STARTING = 1, WF_AP = 2, WF_FAIL = 3 };
 enum { FA_NONE = 0, FA_RENAME = 1, FA_DELETE = 2 };
 enum { BLE_IDLE = 0, BLE_SCAN, BLE_CONNECTING, BLE_READY };
@@ -170,6 +177,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define BTN_DOWN  4
 #define BTN_OK    5
 #define BTN_UP    6
+#define BTN_BOOT  0       // BOOT button, usable as a normal input after reset
 
 #define SD_SCK    39      // microSD on its own SPI bus (SPI3/HSPI), per Elecrow's 5.79_TF example
 #define SD_MISO   13
@@ -232,6 +240,8 @@ static char     statusMsg[64] = "";
 static uint32_t statusUntil = 0;
 static char     fileNames[24][40];
 static uint32_t fileSizes[24];
+static bool     fileSecret[24];              // entry lives in /secret (private)
+static bool     docSecret = false;           // the open document is private
 static uint8_t  nFiles = 0, fileSel = 0;
 static uint8_t  fileAction = FA_NONE;        // pending action in the file list
 static char     renameBuf[40];
@@ -246,7 +256,10 @@ static bool     wallFileOk = false;
 static volatile bool wallReload = false;
 static uint8_t  deskSel = 0, setSel = 0;
 static bool     setConfirm = false;          // "press Y" pending in Settings
-static bool     locked = false;
+static bool     privOpen = false;            // private documents visible this session
+static bool     btnEvent = false;            // current key event comes from a board button
+static bool     pairDismissed = false;       // pairing screen skipped with a board button
+static uint8_t  viewReturn = UI_EDIT;        // where the viewer returns to
 static uint8_t  autoLockMin = 0;             // 0 = off
 static uint8_t  lockFails = 0;
 static uint32_t lockUntil = 0;
@@ -637,12 +650,19 @@ static uint32_t wordCount(void) {
 /*===========================================================================
  *  SECTION 7 - FILES (LittleFS, UTF-8 on disk, Latin-1 in memory)
  *=========================================================================*/
-static void docPath(const char *name, char *out, size_t n) { snprintf(out, n, "/docs/%s", name); }
+/* Documents live in /docs (public) or /secret (private, Casio-style "secret
+ * area": visible only after the password is entered in this session). */
+static const char *dirOf(bool sec) { return sec ? "/secret" : "/docs"; }
+static void docPath(const char *name, bool sec, char *out, size_t n) { snprintf(out, n, "%s/%s", dirOf(sec), name); }
+static bool pwIsSet(void);
+static bool privVisible(void) { return !pwIsSet() || privOpen; }
+static bool isMarkdown(const char *n) { size_t l = strlen(n); return l > 3 && !strcasecmp(n + l - 3, ".md"); }
 
 static inline bool volIsSD(void) { return docFS == (fs::FS *)&SD; }
 static const char *volName(void) { return volIsSD() ? "SD card" : "Internal flash"; }
 static const char *prefDocKey(void) { return volIsSD() ? "docS" : "doc"; }
 static const char *prefCurKey(void) { return volIsSD() ? "curS" : "cur"; }
+static const char *prefSecKey(void) { return volIsSD() ? "secS" : "sec"; }
 
 // Human-readable size: B, kB, MB or GB
 static void fmtSize(uint64_t b, char *out, size_t n) {
@@ -655,9 +675,9 @@ static void fmtSize(uint64_t b, char *out, size_t n) {
 /* Replace 'dst' with 'tmp'. littlefs rename() atomically overwrites; FAT does
  * not, so on the SD card the old file is first moved to a hidden backup that
  * loadDoc() can recover if power fails in between. */
-static bool fsReplace(const char *tmp, const char *dst, const char *name) {
+static bool fsReplace(const char *tmp, const char *dst, const char *name, const char *dir) {
   if (!volIsSD()) return LittleFS.rename(tmp, dst);
-  char bak[64]; snprintf(bak, sizeof(bak), "/docs/.bak_%s", name);
+  char bak[64]; snprintf(bak, sizeof(bak), "%s/.bak_%s", dir, name);
   if (SD.exists(bak)) SD.remove(bak);
   if (SD.exists(dst) && !SD.rename(dst, bak)) return false;
   if (!SD.rename(tmp, dst)) { SD.rename(bak, dst); return false; }
@@ -671,15 +691,19 @@ static bool mountSD(void) {
   delay(20);
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   sdMounted = SD.begin(SD_CS, sdSPI, SD_SPI_HZ, "/sd", 5) && SD.cardType() != CARD_NONE;
-  if (sdMounted && !SD.exists("/docs")) SD.mkdir("/docs");
+  if (sdMounted && !SD.exists("/docs"))   SD.mkdir("/docs");
+  if (sdMounted && !SD.exists("/secret")) SD.mkdir("/secret");
   DBG("[SD] %s\n", sdMounted ? "mounted" : "not present");
   return sdMounted;
 }
 
 static bool saveDoc(void) {
   uint32_t t0 = millis();
-  char path[56]; docPath(docName, path, sizeof(path));
-  File f = docFS->open("/docs/.tmp", "w");
+  const char *dir = dirOf(docSecret);
+  char path[64], tmp[64];
+  docPath(docName, docSecret, path, sizeof(path));
+  snprintf(tmp, sizeof(tmp), "%s/.tmp", dir);
+  File f = docFS->open(tmp, "w");
   if (!f) return false;
   uint8_t buf[512]; size_t k = 0;
   uint32_t len = docLen();
@@ -691,10 +715,11 @@ static bool saveDoc(void) {
   }
   if (k) f.write(buf, k);
   f.close();
-  bool ok = fsReplace("/docs/.tmp", path, docName);
+  bool ok = fsReplace(tmp, path, docName, dir);
   if (ok) {
     docDirty = false;
     prefs.putString(prefDocKey(), docName);
+    prefs.putBool(prefSecKey(), docSecret);
     prefs.putUInt(prefCurKey(), cursorPos);
   }
   DBG("[FS] saved %s (%lu B) %s in %lu ms\n", path, (unsigned long)len, ok ? "OK" : "ERROR",
@@ -702,12 +727,13 @@ static bool saveDoc(void) {
   return ok;
 }
 
-static void loadDoc(const char *name) {
-  char path[56]; docPath(name, path, sizeof(path));
+static void loadDoc(const char *name, bool sec) {
+  char path[64]; docPath(name, sec, path, sizeof(path));
   xSemaphoreTake(docMutex, portMAX_DELAY);
   docClear();
   strlcpy(docName, name, sizeof(docName));
-  char bak[64]; snprintf(bak, sizeof(bak), "/docs/.bak_%s", name);
+  docSecret = sec;
+  char bak[72]; snprintf(bak, sizeof(bak), "%s/.bak_%s", dirOf(sec), name);
   if (!docFS->exists(path) && docFS->exists(bak)) docFS->rename(bak, path);   // recover
   File f = docFS->open(path, "r");
   if (f) {
@@ -731,34 +757,61 @@ static void loadDoc(const char *name) {
   fixViewport();
   xSemaphoreGive(docMutex);
   prefs.putString(prefDocKey(), docName);
+  prefs.putBool(prefSecKey(), docSecret);
   DBG("[FS] opened %s:%s (%lu B)\n", volName(), path, (unsigned long)docLen());
 }
 
+static bool nameTaken(const char *name) {              // names are unique across both folders
+  char a[64], b[64];
+  docPath(name, false, a, sizeof(a)); docPath(name, true, b, sizeof(b));
+  return docFS->exists(a) || docFS->exists(b);
+}
+
 static void newDocName(char *out, size_t n) {
-  char path[56];
   for (int i = 1; i < 100; i++) {
     snprintf(out, n, "note%02d.txt", i);
-    docPath(out, path, sizeof(path));
-    if (!docFS->exists(path)) return;
+    if (!nameTaken(out)) return;
   }
   snprintf(out, n, "note%08lx.txt", (unsigned long)esp_random());
 }
 
-static void listFiles(void) {
-  nFiles = 0;
-  File d = docFS->open("/docs");
+static void listDir(bool sec) {
+  File d = docFS->open(dirOf(sec));
   if (!d) return;
   File e;
   while ((e = d.openNextFile()) && nFiles < 24) {
     const char *nm = e.name();
     const char *b = strrchr(nm, '/'); b = b ? b + 1 : nm;
-    if (b[0] != '.') { fileSizes[nFiles] = e.size(); strlcpy(fileNames[nFiles++], b, 40); }
+    if (b[0] != '.' && !e.isDirectory()) {
+      fileSizes[nFiles] = e.size(); fileSecret[nFiles] = sec;
+      strlcpy(fileNames[nFiles++], b, 40);
+    }
     e.close();
   }
   d.close();
+}
+
+static void listFiles(void) {
+  nFiles = 0;
+  listDir(false);
+  if (privVisible()) listDir(true);
   fsUsed  = volIsSD() ? SD.usedBytes()  : LittleFS.usedBytes();
   fsTotal = volIsSD() ? SD.totalBytes() : LittleFS.totalBytes();
   if (fileSel >= nFiles) fileSel = nFiles ? nFiles - 1 : 0;
+}
+
+// Opens the first public document, or creates one (used when the open one disappears)
+static void newDoc(void);
+static void openFirstPublic(void) {
+  bool saved = privOpen; privOpen = false;   // list public entries only
+  uint8_t sel = fileSel;
+  listFiles();
+  privOpen = saved;
+  bool found = false;
+  for (uint8_t i = 0; i < nFiles; i++) if (!fileSecret[i]) { loadDoc(fileNames[i], false); found = true; break; }
+  if (!found) { uint8_t m = uiMode; newDoc(); uiMode = m; }
+  fileSel = sel;
+  listFiles();
 }
 
 /*===========================================================================
@@ -914,9 +967,11 @@ static void drawHeader(uint32_t words) {
              (unsigned long)words, capsLock ? "CAPS  |  " : "", bt, bat);
   text16(SCR_W - strLen8(right) * 8, 1, right, false);
 
-  snprintf(left, sizeof(left), " ELECTGPL WRITER  %s%s   Ctrl+H help", docName, docDirty ? " *" : "");
+  const char *pp = docSecret ? "[P] " : "";
+  snprintf(left, sizeof(left), " ELECTGPL WRITER  %s%s%s%s", pp, docName, docDirty ? " *" : "",
+           (pwIsSet() && privOpen) ? "   PRIVATE OPEN" : "   Ctrl+H help");
   if (strLen8(left) + strLen8(right) > SCR_W / 8 - 1)          // drop the hint if it does not fit
-    snprintf(left, sizeof(left), " ELECTGPL WRITER  %s%s", docName, docDirty ? " *" : "");
+    snprintf(left, sizeof(left), " ELECTGPL WRITER  %s%s%s", pp, docName, docDirty ? " *" : "");
   text16(0, 1, left, false);
 }
 
@@ -967,7 +1022,7 @@ static void renderFiles(void) {
   else if (fileAction == FA_DELETE && nFiles)
     snprintf(hint, sizeof(hint), "Delete %s ?   Y: yes   any other key: no", fileNames[fileSel]);
   else
-    snprintf(hint, sizeof(hint), "Enter: open   N: new   R: rename   D/Del: delete   Esc: back");
+    snprintf(hint, sizeof(hint), "Enter: open  N: new  R: rename  D: delete  P: private  Esc: back");
   text16(TXT_X + 84, TXT_Y + 5, hint, true);
   hLine(TXT_X, SCR_W - TXT_X, TXT_Y + 27, true);
 
@@ -976,16 +1031,17 @@ static void renderFiles(void) {
   for (int i = 0; i < perPage && first + i < nFiles; i++) {
     int idx = first + i, y = y0 + i * 26;
     char line[72];
-    bool open = !strcmp(fileNames[idx], docName);
+    bool open = !strcmp(fileNames[idx], docName) && fileSecret[idx] == docSecret;
     if (idx == fileSel && fileAction == FA_RENAME)
       snprintf(line, sizeof(line), "%s_", renameBuf);
     else
-      snprintf(line, sizeof(line), "%-36s %8lu B %s", fileNames[idx],
+      snprintf(line, sizeof(line), "%s%-32s %8lu B %s", fileSecret[idx] ? "[P] " : "    ", fileNames[idx],
                (unsigned long)fileSizes[idx], open ? "(open)" : "");
     if (idx == fileSel) { fillRect(TXT_X - 4, y - 1, SCR_W - 2 * TXT_X + 8, 25, true); text24(TXT_X, y, line, false); }
     else text24(TXT_X, y, line, true);
   }
   if (!nFiles) text24C(y0 + 60, "(no files)");
+  if (pwIsSet() && !privOpen) text16(TXT_X, SCR_H - 37, "Private documents hidden (desktop item 7 to unlock)", true);
 
   char foot[112], u[16], t[16];
   fmtSize(fsUsed, u, sizeof(u)); fmtSize(fsTotal, t, sizeof(t));
@@ -1003,7 +1059,7 @@ static void renderHelp(void) {
     "Ctrl+N      New document",
     "Ctrl+W      File transfer (WiFi hotspot)",
     "Ctrl+R      Full refresh (anti-ghosting)",
-    "Ctrl+L      Lock (if a password is set)",
+    "Ctrl+L      Hide private documents",
     "Ctrl+P      Markdown preview (read-only)",
     "Ctrl+H      This help",
     "Ctrl+Home/End  Start / end of document",
@@ -1015,14 +1071,15 @@ static void renderHelp(void) {
     "DESKTOP: arrows + Enter, or keys 1-7",
     "FILE LIST (Ctrl+O)",
     "Up/Down Select  Enter Open  N New",
-    "R Rename   D/Del Delete (Y confirms)",
-    "PREVIEW: arrows PgUp/PgDn Space Home/End",
+    "R Rename  D Delete  P Private (password)",
+    "VIEW: arrows PgUp/PgDn Space Home/End",
+    "",
     "TRANSFER: join WiFi " AP_SSID,
     "  password " AP_PASS,
     "  then browse http://192.168.4.1",
     "",
-    "BUTTONS: EXIT desktop   OK save",
-    "  MENU refresh   UP/DN page",
+    "BUTTONS: UP/DN move/page  OK select",
+    "  EXIT back  BOOT desktop  MENU refresh",
     "  EXIT held 3 s: forget keyboard",
   };
   for (unsigned i = 0; i < sizeof(L) / sizeof(L[0]); i++)
@@ -1077,7 +1134,7 @@ static void panel(int x, int y, int w, int h) {
 }
 
 static const char *DESK_ITEMS[] = { "Continue writing", "New document", "Documents",
-                                    "File transfer", "Settings", "Help", "Lock" };
+                                    "File transfer", "Settings", "Help", "Private: unlock" };
 static uint8_t deskCount(void) { return pwIsSet() ? 7 : 6; }
 
 static void renderDesk(void) {
@@ -1091,12 +1148,14 @@ static void renderDesk(void) {
   char line[48];
   for (uint8_t i = 0; i < deskCount(); i++) {
     int y = py0 + 30 + i * 25;
-    snprintf(line, sizeof(line), "%u  %s", i + 1, DESK_ITEMS[i]);
+    const char *it = (i == 0 && bleState != BLE_READY) ? "Read document" :
+                     (i == 6 && privOpen) ? "Private: lock" : DESK_ITEMS[i];
+    snprintf(line, sizeof(line), "%u  %s", i + 1, it);
     if (i == deskSel) { fillRect(px0 + 6, y - 1, pw - 12, 24, true); text24(px0 + 12, y, line, false); }
     else text24(px0 + 12, y, line, true);
   }
   char sz[16]; fmtSize(docLen(), sz, sizeof(sz));
-  snprintf(line, sizeof(line), "Last: %.24s (%s)", docName, sz);          // fits the panel
+  snprintf(line, sizeof(line), "Last: %s%.20s (%s)", docSecret ? "[P] " : "", docName, sz);
   text16(px0 + 10, py0 + ph - 20, line, true);
 }
 
@@ -1107,7 +1166,7 @@ static void renderSettings(void) {
   drawHeader(wordCount());
   text24(TXT_X, TXT_Y, "SETTINGS", true);
   text16(TXT_X + 120, TXT_Y + 5,
-         setConfirm ? "Press Y to confirm, any other key to cancel"
+         setConfirm ? "Press Y or OK to confirm, any other key to cancel"
                     : "Up/Down: select   Enter: change   Esc: back", true);
   hLine(TXT_X, SCR_W - TXT_X, TXT_Y + 27, true);
   char val[48], line[80];
@@ -1115,7 +1174,7 @@ static void renderSettings(void) {
     const char *lab = "";
     switch (i) {
       case 0: lab = "Password";        snprintf(val, sizeof(val), "%s", pwIsSet() ? "set (Enter: change/remove)" : "not set (Enter: set)"); break;
-      case 1: lab = "Auto-lock";       if (autoLockMin) snprintf(val, sizeof(val), "%u min", autoLockMin); else snprintf(val, sizeof(val), "off"); break;
+      case 1: lab = "Auto-hide priv.";       if (autoLockMin) snprintf(val, sizeof(val), "%u min", autoLockMin); else snprintf(val, sizeof(val), "off"); break;
       case 2: lab = "Keyboard layout"; snprintf(val, sizeof(val), "%s", LAYOUT_NAMES[kbdLayout]); break;
       case 3: lab = "Storage";         snprintf(val, sizeof(val), "%s%s", volName(), sdMounted ? "" : " (no SD card)"); break;
       case 4: lab = "Copy documents";  snprintf(val, sizeof(val), sdMounted ? "all to %s" : "needs an SD card", volIsSD() ? "internal flash" : "SD card"); break;
@@ -1142,28 +1201,14 @@ static void renderInput(void) {
   drawWallpaper();
   drawHeader(wordCount());
   panel(146, 64, 500, 150);
-  const char *t = inPurpose == IN_PW_OLD ? "Current password" :
+  const char *t = inPurpose == IN_UNLOCK ? "Password for private documents" :
+                  inPurpose == IN_PW_OLD ? "Current password" :
                   inPurpose == IN_PW_NEW1 ? "New password (empty = remove)" : "Repeat new password";
   text24(166, 80, t, true);
   drawMaskedField(166, 120, 460);
   text16(166, 180, "Enter: accept    Esc: cancel", true);
 }
 
-static void renderLock(void) {
-  drawWallpaper();
-  fillRect(0, 0, SCR_W, HDR_H, true);                     // no document name while locked
-  text16(0, 1, " ELECTGPL WRITER", false);
-  const char *bt = (bleState == BLE_READY) ? "BT OK " : "BT -- ";
-  text16(SCR_W - strLen8(bt) * 8, 1, bt, false);
-  panel(146, 64, 500, 150);
-  fillRect(146, 64, 500, 26, true);
-  text24(166, 66, "LOCKED", false);
-  drawMaskedField(166, 106, 460);
-  char m[64] = "Type the password and press Enter";
-  if (millis() < lockUntil) snprintf(m, sizeof(m), "Too many attempts: wait %lu s", (unsigned long)((lockUntil - millis()) / 1000 + 1));
-  else if (lockFails) snprintf(m, sizeof(m), "Wrong password (%u)", lockFails);
-  text16(166, 170, m, true);
-}
 
 static void renderPair(void) {
   fillRect(0, 0, SCR_W, HDR_H, true);
@@ -1177,6 +1222,7 @@ static void renderPair(void) {
     text24C(60,  "Searching for a BLE keyboard...");
     text24C(120, "On the K380s: hold an Easy-Switch key for 3 s");
     text24C(150, "until its LED blinks fast.");
+    text16((SCR_W - 52 * 8) / 2, 245, "No keyboard? Press any side button to read documents", true);
     text24C(210, bleState == BLE_CONNECTING ? "Connecting..." : "");
   }
 }
@@ -1418,7 +1464,22 @@ static void mdLine(const char *line, int ll, uint32_t src, bool *fence) {
   mdAppend(t, tl);
 }
 
+// Plain-text view (non-.md files): every source line is word-wrapped on its own,
+// blank lines and leading indentation are kept.
+static void mdPlainLine(const char *line, int ll, uint32_t src) {
+  if (!ll) { mdEmit(MD_TEXT, 0, 0, src, nullptr, 0); return; }
+  mdParaN = 0;
+  bool lead = true;
+  for (int k = 0; k < ll; k++) {
+    uint8_t c = (uint8_t)line[k];
+    if (lead && c == ' ') c = 0xA0; else lead = false;         // no-break space keeps indentation
+    paraPush(c, 0);
+  }
+  mdWrap(MD_TEXT, 0, 0, src, nullptr, 0, mdPara, mdParaN, MD_W);
+}
+
 static void mdBuild(void) {
+  bool markdown = isMarkdown(docName);
   mdCellsN = mdLinesN = 0; mdRawN = 0; mdOom = false;
   pOpen = false; pHard = false; pMarkerN = 0;
   static char line[1024];
@@ -1430,7 +1491,7 @@ static void mdBuild(void) {
     int ll = (e - pos) < sizeof(line) - 1 ? (int)(e - pos) : (int)sizeof(line) - 1;
     for (int k = 0; k < ll; k++) line[k] = docAt(pos + k);
     line[ll] = 0;
-    mdLine(line, ll, pos, &fence);
+    if (markdown) mdLine(line, ll, pos, &fence); else mdPlainLine(line, ll, pos);
     if (e >= len) break;
     pos = e + 1;
   }
@@ -1486,10 +1547,11 @@ static void mdGlyph(int x, int y, uint16_t cell, uint8_t scale) {
 static void renderPreview(void) {
   fillRect(0, 0, SCR_W, HDR_H, true);
   char l[64], r[64];
-  snprintf(l, sizeof(l), " PREVIEW  %s", docName);
+  snprintf(l, sizeof(l), " %s  %s%s", isMarkdown(docName) ? "PREVIEW" : "VIEW",
+           docSecret ? "[P] " : "", docName);
   text16(0, 1, l, false);
   uint32_t mt = mdMaxTop();
-  snprintf(r, sizeof(r), "%u%%   Ctrl+P / Esc: edit ",
+  snprintf(r, sizeof(r), "%u%%   UP/DN: page   EXIT/Esc: back ",
            (unsigned)(mt ? (uint64_t)mdTop * 100 / mt : 100));
   text16(SCR_W - strLen8(r) * 8, 1, r, false);
 
@@ -1525,7 +1587,8 @@ static void renderPreview(void) {
   }
 }
 
-static void startPreview(void) {
+static void startPreview(uint8_t ret) {
+  viewReturn = ret;
   xSemaphoreTake(docMutex, portMAX_DELAY);
   mdBuild();
   mdTop = 0;                                           // open at the cursor's paragraph
@@ -1541,11 +1604,13 @@ static void handlePreviewKey(uint8_t u, bool ctrl) {
   uint32_t mt = mdMaxTop();
   int area = SCR_H - MD_Y0;
   switch (u) {
-    case 0x29: uiMode = UI_EDIT; return;                               // Esc
-    case 0x13: if (ctrl) uiMode = UI_EDIT; return;                     // Ctrl+P
+    case 0x29: uiMode = viewReturn;                                    // Esc
+               if (viewReturn == UI_FILES) listFiles();
+               return;
+    case 0x13: if (ctrl && bleState == BLE_READY) uiMode = UI_EDIT; return;   // Ctrl+P: edit
     case 0x51: if (mdTop < mt) mdTop++; return;                        // down
     case 0x52: if (mdTop) mdTop--; return;                             // up
-    case 0x4E: case 0x2C: {                                            // PgDn / Space
+    case 0x4E: case 0x2C: case 0x28: {                                 // PgDn / Space / Enter (OK)
       int h = 0;
       while (mdTop < mt && h + mdHeight(mdLines[mdTop].kind) <= area - 24) h += mdHeight(mdLines[mdTop++].kind);
       return;
@@ -1565,10 +1630,9 @@ static bool pairShown = false;               // last frame was the pairing scree
 static void renderFrame(void) {
   paintClear();
   bool needPair = passkeyActive ||
-                  (bleState != BLE_READY && numBonds == 0);
+                  (bleState != BLE_READY && numBonds == 0 && !pairDismissed);
   pairShown = needPair;
   if (needPair)               renderPair();
-  else if (locked)            renderLock();
   else if (uiMode == UI_DESK)  renderDesk();
   else if (uiMode == UI_SETTINGS) renderSettings();
   else if (uiMode == UI_INPUT) renderInput();
@@ -1716,7 +1780,7 @@ static void moveVertical(int d) {
 static void startFiles(void) {
   if (docDirty) saveDoc();
   listFiles();
-  for (uint8_t i = 0; i < nFiles; i++) if (!strcmp(fileNames[i], docName)) fileSel = i;
+  for (uint8_t i = 0; i < nFiles; i++) if (!strcmp(fileNames[i], docName) && fileSecret[i] == docSecret) fileSel = i;
   if (uiMode != UI_FILES) prevMode = uiMode;
   uiMode = UI_FILES;
 }
@@ -1727,6 +1791,7 @@ static void newDoc(void) {
   xSemaphoreTake(docMutex, portMAX_DELAY);
   docClear();
   strlcpy(docName, nm, sizeof(docName));
+  docSecret = false;
   docDirty = true;
   uiMode = UI_EDIT;
   xSemaphoreGive(docMutex);
@@ -1742,32 +1807,50 @@ static void doRename(void) {
   String nn = renameBuf;
   if (nn.indexOf('.') < 0) nn += ".txt";
   if (!safeName(nn)) { setStatus("Invalid name (a-z 0-9 . _ -, .txt/.md)"); return; }
-  char oldP[56], newP[56];
-  docPath(fileNames[fileSel], oldP, sizeof(oldP));
-  docPath(nn.c_str(), newP, sizeof(newP));
+  bool sec = fileSecret[fileSel];
+  char oldP[64], newP[64];
+  docPath(fileNames[fileSel], sec, oldP, sizeof(oldP));
+  docPath(nn.c_str(), sec, newP, sizeof(newP));
   if (!strcmp(oldP, newP)) { fileAction = FA_NONE; return; }
-  if (docFS->exists(newP)) { setStatus("Name already in use"); return; }
-  bool isOpen = !strcmp(fileNames[fileSel], docName);
+  if (nameTaken(nn.c_str())) { setStatus("Name already in use"); return; }
+  bool isOpen = !strcmp(fileNames[fileSel], docName) && sec == docSecret;
   if (isOpen && docDirty) saveDoc();
   if (!docFS->rename(oldP, newP)) { setStatus("ERROR renaming"); return; }
-  if (isOpen) { strlcpy(docName, nn.c_str(), sizeof(docName)); prefs.putString("doc", docName); }
+  if (isOpen) { strlcpy(docName, nn.c_str(), sizeof(docName)); prefs.putString(prefDocKey(), docName); }
   listFiles();
   for (uint8_t i = 0; i < nFiles; i++) if (nn == fileNames[i]) fileSel = i;
   fileAction = FA_NONE;
   setStatus("Renamed");
 }
 
+// P in the file list: move the entry between /docs and /secret
+static void toggleSecret(void) {
+  if (!nFiles) return;
+  if (!pwIsSet()) { setStatus("Set a password in Settings first", 4000); return; }
+  if (!privOpen)  { setStatus("Unlock private documents first", 4000); return; }
+  bool sec = fileSecret[fileSel];
+  char a[64], b[64];
+  docPath(fileNames[fileSel], sec, a, sizeof(a));
+  docPath(fileNames[fileSel], !sec, b, sizeof(b));
+  bool isOpen = !strcmp(fileNames[fileSel], docName) && sec == docSecret;
+  if (isOpen && docDirty) saveDoc();
+  if (!docFS->rename(a, b)) { setStatus("ERROR moving the file"); return; }
+  if (isOpen) { docSecret = !sec; prefs.putBool(prefSecKey(), docSecret); }
+  String nm = fileNames[fileSel];
+  listFiles();
+  for (uint8_t i = 0; i < nFiles; i++) if (nm == fileNames[i]) fileSel = i;
+  setStatus(sec ? "Now public" : "Now private");
+}
+
 static void doDelete(void) {
   if (!nFiles) return;
-  char path[56]; docPath(fileNames[fileSel], path, sizeof(path));
-  bool isOpen = !strcmp(fileNames[fileSel], docName);
+  bool sec = fileSecret[fileSel];
+  char path[64]; docPath(fileNames[fileSel], sec, path, sizeof(path));
+  bool isOpen = !strcmp(fileNames[fileSel], docName) && sec == docSecret;
   if (isOpen) docDirty = false;                 // do not let autosave recreate it
   docFS->remove(path);
   listFiles();
-  if (isOpen) {
-    if (nFiles) loadDoc(fileNames[0]);
-    else { newDoc(); listFiles(); }
-  }
+  if (isOpen) openFirstPublic();
   uiMode = UI_FILES;
   setStatus("Deleted");
 }
@@ -1792,8 +1875,13 @@ static void handleFilesKey(uint8_t u, uint8_t mods) {
     case 0x52: if (fileSel) fileSel--; break;                                   // up
     case 0x51: if (fileSel + 1 < nFiles) fileSel++; break;                      // down
     case 0x28: case 0x58:                                                       // Enter
-      if (nFiles) loadDoc(fileNames[fileSel]);
-      uiMode = UI_EDIT; break;
+      if (!nFiles) break;
+      if (docDirty) saveDoc();
+      loadDoc(fileNames[fileSel], fileSecret[fileSel]);
+      // Without a keyboard (or from a board button) open the read-only viewer
+      if (btnEvent || bleState != BLE_READY) startPreview(UI_FILES);
+      else uiMode = UI_EDIT;
+      break;
     case 0x29: uiMode = prevMode; break;                                        // Esc
     case 0x11: newDoc(); setStatus("New document"); break;                      // N
     case 0x15:                                                                  // R
@@ -1804,18 +1892,22 @@ static void handleFilesKey(uint8_t u, uint8_t mods) {
       }
       break;
     case 0x07: case 0x4C: if (nFiles) fileAction = FA_DELETE; break;           // D / Del
+    case 0x13: toggleSecret(); break;                                           // P
   }
 }
 
 static void wifiOff(void);
 
-static void lockNow(void) {
+static void privLock(void) {
+  if (!privOpen) return;
+  bool wasSecret = docSecret;
   if (docDirty) saveDoc();
-  if (wifiState != WF_OFF) { wifiOff(); if (uiMode == UI_XFER) uiMode = UI_DESK; }
-  locked = true;
-  inLen = 0; inBuf[0] = 0;
-  if (uiMode == UI_INPUT || uiMode == UI_SETTINGS) uiMode = UI_DESK;
-  requestRender();
+  privOpen = false;
+  if (wasSecret) openFirstPublic();                  // never leave a private text on screen
+  if (uiMode == UI_FILES) { fileAction = FA_NONE; listFiles(); }
+  if (wasSecret && (uiMode == UI_EDIT || uiMode == UI_PREVIEW)) uiMode = UI_DESK;
+  setStatus("Private documents locked");
+  DBG("[LOCK] private documents locked\n");
 }
 
 // ASCII-only line entry used by the password dialogs and the lock screen
@@ -1831,30 +1923,28 @@ static void inputKey(uint8_t u, uint8_t mods) {
 
 static void clearInput(void) { memset(inBuf, 0, sizeof(inBuf)); inLen = 0; }
 
-static void handleLockKey(uint8_t u, uint8_t mods) {
-  if (millis() < lockUntil) return;
-  if (u == 0x28 || u == 0x58) {
-    if (pwCheck(inBuf)) {
-      locked = false; lockFails = 0; uiMode = UI_DESK;
-      DBG("[LOCK] unlocked\n");
-    } else {
-      lockFails++;
-      if (lockFails >= 5) lockUntil = millis() + 30000UL * (lockFails - 4);
-      DBG("[LOCK] wrong password (%u)\n", lockFails);
-    }
-    clearInput();
-    return;
-  }
-  if (u == 0x29) { clearInput(); return; }
-  inputKey(u, mods);
-}
 
 static void handleInputKey(uint8_t u, uint8_t mods) {
-  if (u == 0x29) { clearInput(); memset(pwFirst, 0, sizeof(pwFirst)); uiMode = UI_SETTINGS; return; }
+  if (u == 0x29) { clearInput(); memset(pwFirst, 0, sizeof(pwFirst));
+                   uiMode = inPurpose == IN_UNLOCK ? UI_DESK : UI_SETTINGS; return; }
   if (!(u == 0x28 || u == 0x58)) { inputKey(u, mods); return; }
   switch (inPurpose) {
+    case IN_UNLOCK:
+      if (millis() < lockUntil) { setStatus("Too many attempts, wait"); break; }
+      if (pwCheck(inBuf)) {
+        privOpen = true; lockFails = 0; uiMode = UI_DESK;
+        setStatus("Private documents visible");
+        DBG("[LOCK] private documents unlocked\n");
+      } else {
+        lockFails++;
+        if (lockFails >= 5) lockUntil = millis() + 30000UL * (lockFails - 4);
+        char m[48]; snprintf(m, sizeof(m), "Wrong password (%u)", lockFails);
+        setStatus(m);
+      }
+      break;
     case IN_PW_OLD:
       if (!pwCheck(inBuf)) { setStatus("Wrong password"); clearInput(); uiMode = UI_SETTINGS; return; }
+      privOpen = true;
       inPurpose = IN_PW_NEW1; break;
     case IN_PW_NEW1:
       if (!inLen) { pwClear(); autoLockMin = 0; prefs.putUChar("alock", 0);
@@ -1863,7 +1953,7 @@ static void handleInputKey(uint8_t u, uint8_t mods) {
       strlcpy(pwFirst, inBuf, sizeof(pwFirst)); inPurpose = IN_PW_NEW2; break;
     case IN_PW_NEW2:
       if (strcmp(pwFirst, inBuf)) { setStatus("Passwords do not match"); inPurpose = IN_PW_NEW1; }
-      else { pwStore(inBuf); setStatus("Password set"); uiMode = UI_SETTINGS; }
+      else { pwStore(inBuf); privOpen = true; setStatus("Password set"); uiMode = UI_SETTINGS; }
       memset(pwFirst, 0, sizeof(pwFirst));
       break;
   }
@@ -1874,15 +1964,26 @@ static void newDoc(void);
 static void startFiles(void);
 static void toggleWiFi(void);
 
+static bool needKeyboard(void) {
+  if (bleState == BLE_READY) return false;
+  setStatus("Connect the keyboard for this", 3000);
+  return true;
+}
+
 static void deskActivate(uint8_t i) {
   switch (i) {
-    case 0: uiMode = UI_EDIT; break;
-    case 1: newDoc(); setStatus("New document"); break;
+    case 0:                                                      // continue / read
+      if (btnEvent || bleState != BLE_READY) startPreview(UI_DESK); else uiMode = UI_EDIT;
+      break;
+    case 1: if (!needKeyboard()) { newDoc(); setStatus("New document"); } break;
     case 2: startFiles(); break;
     case 3: prevMode = UI_DESK; toggleWiFi(); break;
     case 4: setSel = 0; setConfirm = false; uiMode = UI_SETTINGS; break;
     case 5: prevMode = UI_DESK; uiMode = UI_HELP; break;
-    case 6: if (pwIsSet()) lockNow(); break;
+    case 6:
+      if (privOpen) privLock();
+      else if (!needKeyboard()) { clearInput(); inPurpose = IN_UNLOCK; uiMode = UI_INPUT; }
+      break;
   }
 }
 
@@ -1902,14 +2003,30 @@ static void switchVolume(bool toSD) {
   docFS = toSD ? (fs::FS *)&SD : (fs::FS *)&LittleFS;
   prefs.putUChar("vol", toSD ? 1 : 0);
   String last = prefs.getString(prefDocKey(), "");
-  if (last.length() && docFS->exists("/docs/" + last)) loadDoc(last.c_str());
-  else {
-    listFiles();
-    if (nFiles) loadDoc(fileNames[0]);
-    else { uint8_t m = uiMode; newDoc(); uiMode = m; }
-  }
+  bool sec = prefs.getBool(prefSecKey(), false) && privVisible();
+  if (last.length() && docFS->exists(String(dirOf(sec)) + "/" + last)) loadDoc(last.c_str(), sec);
+  else openFirstPublic();
   listFiles();
   setStatus(toSD ? "Now using the SD card" : "Now using internal flash");
+}
+
+// Copy every document of the active volume to the other one (existing files are kept)
+static void copyDir(fs::FS &src, fs::FS &dst, const char *dir, unsigned &copied, unsigned &skipped) {
+  static uint8_t buf[2048];
+  if (!dst.exists(dir)) dst.mkdir(dir);
+  File d = src.open(dir);
+  File e;
+  while (d && (e = d.openNextFile())) {
+    const char *nm = e.name();
+    const char *b = strrchr(nm, '/'); b = b ? b + 1 : nm;
+    if (b[0] == '.' || e.isDirectory()) { e.close(); continue; }
+    String p = String(dir) + "/" + b;
+    if (dst.exists(p)) { skipped++; e.close(); continue; }
+    File o = dst.open(p, "w");
+    if (o) { size_t n; while ((n = e.read(buf, sizeof(buf))) > 0) o.write(buf, n); o.close(); copied++; }
+    e.close();
+  }
+  if (d) d.close();
 }
 
 // Copy every document of the active volume to the other one (existing files are kept)
@@ -1918,22 +2035,9 @@ static void copyAllDocs(void) {
   if (docDirty) saveDoc();
   fs::FS &src = *docFS;
   fs::FS &dst = volIsSD() ? (fs::FS &)LittleFS : (fs::FS &)SD;
-  if (!dst.exists("/docs")) dst.mkdir("/docs");
   unsigned copied = 0, skipped = 0;
-  File d = src.open("/docs");
-  File e;
-  static uint8_t buf[2048];
-  while (d && (e = d.openNextFile())) {
-    const char *nm = e.name();
-    const char *b = strrchr(nm, '/'); b = b ? b + 1 : nm;
-    if (b[0] == '.') { e.close(); continue; }
-    String p = String("/docs/") + b;
-    if (dst.exists(p)) { skipped++; e.close(); continue; }
-    File o = dst.open(p, "w");
-    if (o) { size_t n; while ((n = e.read(buf, sizeof(buf))) > 0) o.write(buf, n); o.close(); copied++; }
-    e.close();
-  }
-  if (d) d.close();
+  copyDir(src, dst, "/docs", copied, skipped);
+  if (privVisible()) copyDir(src, dst, "/secret", copied, skipped);
   char m[64]; snprintf(m, sizeof(m), "Copied %u, skipped %u (already there)", copied, skipped);
   setStatus(m, 5000);
 }
@@ -1941,7 +2045,7 @@ static void copyAllDocs(void) {
 static void handleSettingsKey(uint8_t u) {
   if (setConfirm) {
     setConfirm = false;
-    if (u == 0x1C) { reqUnpair = true; setStatus("Pairing deleted"); }              // Y
+    if (u == 0x1C || u == 0x28) { reqUnpair = true; setStatus("Pairing deleted"); } // Y or Enter/OK
     return;
   }
   switch (u) {
@@ -1952,7 +2056,8 @@ static void handleSettingsKey(uint8_t u) {
     default: return;
   }
   switch (setSel) {
-    case 0: clearInput(); inPurpose = pwIsSet() ? IN_PW_OLD : IN_PW_NEW1; uiMode = UI_INPUT; break;
+    case 0: if (needKeyboard()) break;
+            clearInput(); inPurpose = pwIsSet() ? IN_PW_OLD : IN_PW_NEW1; uiMode = UI_INPUT; break;
     case 1:
       if (!pwIsSet()) { setStatus("Set a password first"); break; }
       autoLockMin = autoLockMin == 0 ? 5 : autoLockMin == 5 ? 15 : autoLockMin == 15 ? 30 : 0;
@@ -1976,7 +2081,6 @@ static void handlePress(uint8_t u, uint8_t mods, bool repeat) {
 
   if (u == 0x39) { if (!repeat) capsLock = !capsLock; requestRender(); return; }
 
-  if (locked)                { if (!repeat) handleLockKey(u, mods); requestRender(); return; }
   if (uiMode == UI_DESK)     { if (!repeat) handleDeskKey(u); requestRender(); return; }
   if (uiMode == UI_SETTINGS) { if (!repeat) handleSettingsKey(u); requestRender(); return; }
   if (uiMode == UI_INPUT)    { handleInputKey(u, mods); requestRender(); return; }
@@ -1996,8 +2100,8 @@ static void handlePress(uint8_t u, uint8_t mods, bool repeat) {
       case 0x12: startFiles(); break;                                              // O
       case 0x11: newDoc(); setStatus("New document"); break;                       // N
       case 0x0B: prevMode = uiMode; uiMode = UI_HELP; break;                       // H
-      case 0x0F: if (pwIsSet()) lockNow(); break;                                  // L
-      case 0x13: startPreview(); break;                                            // P
+      case 0x0F: privLock(); break;                                                // L
+      case 0x13: startPreview(UI_EDIT); break;                                     // P
       case 0x1A: prevMode = uiMode; toggleWiFi(); break;                           // W
       case 0x15: cleanRequest = true; break;                                       // R
       case 0x4A: case 0x4D:                                                        // Ctrl+Home/End
@@ -2473,9 +2577,10 @@ static void webRoot(void) {
                "<h2>ELECTGPL WRITER</h2>");
   h += "<p>Storage: " + String(volName()) + "</p><table>";
   for (uint8_t i = 0; i < nFiles; i++) {
-    h += "<tr><td>" + String(fileNames[i]) + "</td><td>" + String(fileSizes[i]) +
-         " B</td><td><a href='/dl?f=" + fileNames[i] +
-         "'>download</a></td><td><a href='/del?f=" + fileNames[i] +
+    String q = String(fileNames[i]) + (fileSecret[i] ? "&s=1" : "");
+    h += "<tr><td>" + String(fileSecret[i] ? "[P] " : "") + String(fileNames[i]) + "</td><td>" + String(fileSizes[i]) +
+         " B</td><td><a href='/dl?f=" + q +
+         "'>download</a></td><td><a href='/del?f=" + q +
          "' onclick=\"return confirm('Delete?')\">delete</a></td></tr>";
   }
   h += F("</table>"
@@ -2503,7 +2608,9 @@ static void webRoot(void) {
 static void webDownload(void) {
   String n = server.arg("f");
   if (!safeName(n)) { server.send(400, "text/plain", "invalid name"); return; }
-  File f = docFS->open("/docs/" + n, "r");
+  bool sec = server.arg("s") == "1";
+  if (sec && !privVisible()) { server.send(403, "text/plain", "private documents are locked"); return; }
+  File f = docFS->open(String(dirOf(sec)) + "/" + n, "r");
   if (!f) { server.send(404, "text/plain", "not found"); return; }
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + n + "\"");
   server.streamFile(f, "text/plain; charset=utf-8");
@@ -2512,7 +2619,9 @@ static void webDownload(void) {
 
 static void webDelete(void) {
   String n = server.arg("f");
-  if (safeName(n) && n != docName) docFS->remove("/docs/" + n);
+  bool sec = server.arg("s") == "1";
+  if (safeName(n) && !(n == docName && sec == docSecret) && (!sec || privVisible()))
+    docFS->remove(String(dirOf(sec)) + "/" + n);
   server.sendHeader("Location", "/"); server.send(303);
 }
 
@@ -2527,7 +2636,7 @@ static void webUploadRaw(void) {
     String n = server.header("X-Name");               // encodeURIComponent keeps [A-Za-z0-9._-]
     strlcpy(upName, n.c_str(), sizeof(upName));
     if (upIsWall) upFile = docFS->open(WALL_FILE_PATH, "w");
-    else if (safeName(n) && n != docName) upFile = docFS->open("/docs/" + n, "w");
+    else if (safeName(n) && n != docName && !docFS->exists("/secret/" + n)) upFile = docFS->open("/docs/" + n, "w");
     else upFile = File();
     DBG("[WEB] upload start '%s' (%s) -> %s\n", upName, upIsWall ? "wallpaper" : "note",
         upFile ? "open" : "REJECTED");
@@ -2655,31 +2764,68 @@ static void wifiPoll(void) {
 /*===========================================================================
  *  SECTION 14 - BOARD BUTTONS
  *=========================================================================*/
+static void buttonKey(uint8_t u) {
+  lastInputMs = millis();
+  btnEvent = true;
+  handlePress(u, 0, false);
+  btnEvent = false;
+}
+
+static void goHome(void) {
+  if (wifiState != WF_OFF) wifiOff();
+  if (docDirty) saveDoc();
+  fileAction = FA_NONE; setConfirm = false;
+  uiMode = UI_DESK;
+  requestRender();
+}
+
+/* Side buttons for keyboard-less use ("pocket PDA" viewer):
+ *   UP / DOWN : move (lists) or page (editor / viewer), auto-repeat when held
+ *   OK        : select (Enter); in the editor: save
+ *   EXIT      : back (Esc); held 3 s: forget the keyboard
+ *   BOOT      : desktop          MENU : full refresh */
 static void handleButtons(void) {
-  static const uint8_t pins[5] = { BTN_UP, BTN_DOWN, BTN_OK, BTN_MENU, BTN_EXIT };
-  static uint8_t  last[5] = {1, 1, 1, 1, 1};
-  static uint32_t tDown[5], lastMs = 0;
-  if (millis() - lastMs < 30) return;
-  lastMs = millis();
-  for (uint8_t i = 0; i < 5; i++) {
+  static const uint8_t pins[6] = { BTN_UP, BTN_DOWN, BTN_OK, BTN_MENU, BTN_EXIT, BTN_BOOT };
+  static uint8_t  last[6] = {1, 1, 1, 1, 1, 1};
+  static uint32_t tDown[6], tRep[6], lastMs = 0;
+  uint32_t now = millis();
+  if (now - lastMs < 25) return;                            // debounce
+  lastMs = now;
+  bool pairScreen = !passkeyActive && bleState != BLE_READY && numBonds == 0 && !pairDismissed;
+  for (uint8_t i = 0; i < 6; i++) {
     uint8_t v = digitalRead(pins[i]);
-    if (v == LOW && last[i] == HIGH) tDown[i] = millis();
-    if (v == HIGH && last[i] == LOW) {
-      uint32_t held = millis() - tDown[i];
-      switch (pins[i]) {
-        case BTN_UP:   if (!locked && uiMode == UI_EDIT) handlePress(0x4B, 0, false); break;
-        case BTN_DOWN: if (!locked && uiMode == UI_EDIT) handlePress(0x4E, 0, false); break;
-        case BTN_OK:   if (!locked) setStatus(saveDoc() ? "Saved" : "ERROR saving"); break;
-        case BTN_MENU: cleanRequest = true; requestRender(); break;
-        case BTN_EXIT:
-          if (held >= 3000) { reqUnpair = true; setStatus("Pairing deleted"); }
-          else if (!locked && uiMode != UI_DESK) { if (docDirty) saveDoc();
-                                                   if (uiMode == UI_XFER) wifiOff();
-                                                   uiMode = UI_DESK; requestRender(); }
-          break;
-      }
-    }
+    bool pressed = (v == LOW && last[i] == HIGH), released = (v == HIGH && last[i] == LOW);
     last[i] = v;
+    if (pressed) { tDown[i] = now; tRep[i] = now + 600; }
+    if (pairScreen) {                                       // any button: skip pairing, read docs
+      if (released) { pairDismissed = true; lastInputMs = now; requestRender(); }
+      continue;
+    }
+    if (passkeyActive) continue;
+    bool page = (uiMode == UI_EDIT || uiMode == UI_PREVIEW);
+    if (pins[i] == BTN_UP || pins[i] == BTN_DOWN) {
+      bool rep = (v == LOW && !pressed && (int32_t)(now - tRep[i]) >= 0);
+      if (pressed || rep) {
+        if (rep) tRep[i] = now + 350;
+        uint8_t k = pins[i] == BTN_UP ? (page ? 0x4B : 0x52) : (page ? 0x4E : 0x51);
+        buttonKey(k);
+      }
+      continue;
+    }
+    if (!released) continue;
+    uint32_t held = now - tDown[i];
+    switch (pins[i]) {
+      case BTN_OK:
+        if (uiMode == UI_EDIT) { lastInputMs = now; setStatus(saveDoc() ? "Saved" : "ERROR saving"); }
+        else buttonKey(0x28);
+        break;
+      case BTN_MENU: cleanRequest = true; requestRender(); break;
+      case BTN_EXIT:
+        if (held >= 3000) { reqUnpair = true; pairDismissed = false; setStatus("Pairing deleted"); }
+        else buttonKey(0x29);
+        break;
+      case BTN_BOOT: lastInputMs = now; goHome(); break;
+    }
   }
 }
 
@@ -2695,6 +2841,7 @@ void setup() {
   pinMode(BTN_UP,   INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_OK,   INPUT_PULLUP);
+  pinMode(BTN_BOOT, INPUT_PULLUP);
 
   docMutex = xSemaphoreCreateMutex();
   qKeys    = xQueueCreate(64, sizeof(key_evt_t));
@@ -2714,7 +2861,8 @@ void setup() {
   EPD_Clear_R26A6H();
 
   if (!LittleFS.begin(true)) DBG("[FS] ERROR mounting LittleFS\n");
-  if (!LittleFS.exists("/docs")) LittleFS.mkdir("/docs");
+  if (!LittleFS.exists("/docs"))   LittleFS.mkdir("/docs");
+  if (!LittleFS.exists("/secret")) LittleFS.mkdir("/secret");
   mountSD();
 
   prefs.begin("writer", false);
@@ -2730,15 +2878,16 @@ void setup() {
   loadWallpaper();
   docFS = (sdMounted && prefs.getUChar("vol", 0) == 1) ? (fs::FS *)&SD : (fs::FS *)&LittleFS;
   String last = prefs.getString(prefDocKey(), "");
-  if (last.length() && docFS->exists("/docs/" + last)) {
-    loadDoc(last.c_str());
+  bool lastSec = prefs.getBool(prefSecKey(), false);
+  // A private document is not reopened at boot while a password is set
+  if (last.length() && !(lastSec && pwIsSet()) &&
+      docFS->exists(String(dirOf(lastSec)) + "/" + last)) {
+    loadDoc(last.c_str(), lastSec);
     uint32_t c = prefs.getUInt(prefCurKey(), docLen());
     cursorPos = c > docLen() ? docLen() : c;
     fixViewport();
   } else {
-    char nm[40]; newDocName(nm, sizeof(nm));
-    strlcpy(docName, nm, sizeof(docName));
-    saveDoc();
+    openFirstPublic();
   }
 
   server.on("/", HTTP_GET, webRoot);
@@ -2755,7 +2904,7 @@ void setup() {
 
   if (!psramFound()) setStatus("NO PSRAM: Tools > PSRAM > OPI PSRAM", 60000);
   uiMode = UI_DESK;
-  locked = pwIsSet();
+  privOpen = false;
   lastInputMs = millis();
   xTaskCreatePinnedToCore(displayTask, "epd", 8192, NULL, 2, &dispTaskH, 1);
   xTaskCreatePinnedToCore(bleTask,     "ble", 8192, NULL, 3, NULL, 0);
@@ -2774,13 +2923,11 @@ void loop() {
 
   if (docDirty && (millis() - lastInputMs) > AUTOSAVE_MS) saveDoc();
 
-  if (!locked && autoLockMin && pwIsSet() &&
-      millis() - lastInputMs > (uint32_t)autoLockMin * 60000UL) { DBG("[LOCK] auto-lock\n"); lockNow(); }
+  if (privOpen && autoLockMin && pwIsSet() &&
+      millis() - lastInputMs > (uint32_t)autoLockMin * 60000UL) { DBG("[LOCK] auto-hide\n"); privLock(); }
 
   if (wallReload) { wallReload = false; loadWallpaper(); requestRender(); }
 
-  static uint32_t lockTick = 0;                           // countdown on the lock screen
-  if (locked && millis() < lockUntil + 1000 && millis() - lockTick > 1000) { lockTick = millis(); requestRender(); }
 
   static bool statusShown = false;                        // redraw when the status message expires
   bool active = statusMsg[0] && millis() < statusUntil;
