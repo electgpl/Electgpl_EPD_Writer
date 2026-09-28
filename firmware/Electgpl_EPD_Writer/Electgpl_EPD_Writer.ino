@@ -10,27 +10,39 @@
  *  Arduino IDE board: "ESP32S3 Dev Module"  (arduino-esp32 core 3.x)
  *    Flash Size 8MB | PSRAM: "OPI PSRAM" | Partition: "8M with spiffs"
  *  Libraries: NimBLE-Arduino 2.x (h2zero); builds with 2.1.0 to 2.5.1
- *  Sketch files: this .ino + spleen_fonts.h (same folder)
+ *  Sketch files: this .ino + spleen_fonts.h + wallpaper_builtin.h (same folder)
+ *
+ *  DESKTOP (boot screen)
+ *    PDA-style menu over a wallpaper: Continue writing, New document,
+ *    Documents, File transfer, Settings, Help, Lock. Arrows + Enter or 1-7.
+ *    Esc in the editor returns to the desktop.
  *
  *  STORAGE
- *    Documents live in the internal flash (LittleFS, "spiffs" partition),
- *    folder /docs, UTF-8 encoded. Autosave 3 s after the last keystroke.
- *    The last open document and cursor position are restored at boot.
+ *    Internal flash (LittleFS, "spiffs" partition) or microSD card (FAT),
+ *    selectable in Settings; folder /docs, UTF-8. Autosave 3 s after the last
+ *    keystroke. The last document and cursor are restored per volume.
+ *
+ *  SETTINGS
+ *    Password (privacy lock), auto-lock, keyboard layout, storage volume,
+ *    copy all documents to the other volume, wallpaper, forget keyboard.
+ *    The password is a privacy lock (salted SHA-256 in NVS), NOT encryption.
+ *    Recovery: hold MENU + EXIT while powering up to clear it.
  *
  *  KEYBOARD SHORTCUTS (Ctrl+H shows them on screen)
  *    Ctrl+S save              Ctrl+O file list           Ctrl+N new document
  *    Ctrl+W file transfer     Ctrl+R anti-ghost refresh  Ctrl+H help
- *    Esc    cancel dead key   Ctrl+Home / Ctrl+End  start / end of document
+ *    Ctrl+L lock              Ctrl+Home / Ctrl+End  start / end of document
+ *    Esc    desktop (or cancel a pending dead key)
  *  FILE LIST
  *    Up/Down select   Enter open   N new   R rename   D or Del delete   Esc back
  *  BOARD BUTTONS
- *    MENU = full refresh   OK = save   UP/DOWN = page up/down
+ *    EXIT = desktop   MENU = full refresh   OK = save   UP/DOWN = page up/down
  *    EXIT held 3 s = delete bonds (pair the keyboard again)
  *
  *  FILE TRANSFER (Ctrl+W)
  *    The ESP32-S3 becomes a WiFi hotspot "Electgpl-Writer" (pass electgpl1234).
  *    Join it from the PC and browse http://192.168.4.1 to download, upload
- *    or delete notes. Esc or Ctrl+W closes the hotspot. BLE stays connected.
+ *    or delete notes, or upload a .bmp wallpaper. Esc or Ctrl+W closes it.
  *
  *  PAIRING THE K380s
  *    Hold an Easy-Switch key for 3 s until its LED blinks fast.
@@ -42,11 +54,14 @@
 #include <SPI.h>
 #include <NimBLEDevice.h>
 #include <LittleFS.h>
+#include <SD.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <esp_random.h>
 #include "spleen_fonts.h"
+#include "wallpaper_builtin.h"
+#include <mbedtls/sha256.h>
 #include <esp_wifi.h>
 
 /* The ESP32-S3-WROOM-1-N8R8 has 8 MB of OPI PSRAM, but the Arduino default for
@@ -83,7 +98,16 @@ typedef struct {
 } locate_t;
 
 enum { LAYOUT_LATAM = 0, LAYOUT_ES = 1, LAYOUT_US = 2 };
-enum { UI_EDIT = 0, UI_FILES = 1, UI_HELP = 2, UI_XFER = 3 };
+enum { UI_EDIT = 0, UI_FILES, UI_HELP, UI_XFER, UI_DESK, UI_SETTINGS, UI_INPUT, UI_PREVIEW };
+enum { MD_TEXT = 0, MD_H1, MD_H2, MD_H3, MD_CODE, MD_PRE, MD_QUOTE, MD_HR, MD_GAP };
+typedef struct {             // one display line of the Markdown preview
+  uint32_t c0;               // first cell in mdCells
+  uint32_t src;              // source position (paragraph start)
+  uint16_t n;                // number of cells
+  uint8_t  kind, indent, depth;
+} mdline_t;
+enum { WALL_BUILTIN = 0, WALL_FILE = 1, WALL_NONE = 2 };
+enum { IN_PW_OLD = 0, IN_PW_NEW1, IN_PW_NEW2 };
 enum { WF_OFF = 0, WF_STARTING = 1, WF_AP = 2, WF_FAIL = 3 };
 enum { FA_NONE = 0, FA_RENAME = 1, FA_DELETE = 2 };
 enum { BLE_IDLE = 0, BLE_SCAN, BLE_CONNECTING, BLE_READY };
@@ -97,10 +121,14 @@ enum { BLE_IDLE = 0, BLE_SCAN, BLE_CONNECTING, BLE_READY };
  * (on 3.3.x it is detected as "userOverriddenBtInUse"). */
 extern "C" bool btInUse(void) { return true; }
 
+// loop() runs the web server, the filesystems and the editor: give it 16 kB
+// of stack instead of the default 8 kB.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 /*===========================================================================
  *  SECTION 1 - USER CONFIGURATION
  *=========================================================================*/
-#define KBD_LAYOUT          LAYOUT_LATAM
+#define KBD_LAYOUT          LAYOUT_LATAM  // default; changeable in Settings
 #define KBD_NAME_FILTER     ""          // "" = any BLE keyboard; e.g. "K380"
 
 #define EPD_SPI_HZ          10000000UL  // SSD1683: check tSCYCW in its datasheet
@@ -120,6 +148,10 @@ extern "C" bool btInUse(void) { return true; }
 #define AP_CHANNEL          6
 #define AP_MAX_CLIENTS      2
 
+#define PW_MIN_LEN          4             // minimum password length
+#define PW_HASH_ROUNDS      2000          // SHA-256 iterations for the stored hash
+#define WALL_FILE_PATH      "/wallpaper.bmp"
+
 #define DEBUG_SERIAL        1
 
 /*===========================================================================
@@ -138,6 +170,13 @@ extern "C" bool btInUse(void) { return true; }
 #define BTN_DOWN  4
 #define BTN_OK    5
 #define BTN_UP    6
+
+#define SD_SCK    39      // microSD on its own SPI bus (SPI3/HSPI), per Elecrow's 5.79_TF example
+#define SD_MISO   13
+#define SD_MOSI   40
+#define SD_CS     10
+#define SD_PWR    42      // TF card 3.3 V enable
+#define SD_SPI_HZ 20000000UL
 
 #define EPD_W 800
 #define EPD_H 272
@@ -197,7 +236,28 @@ static uint8_t  nFiles = 0, fileSel = 0;
 static uint8_t  fileAction = FA_NONE;        // pending action in the file list
 static char     renameBuf[40];
 static uint8_t  renameLen = 0;
-static uint32_t fsUsed = 0, fsTotal = 0;     // cached by listFiles()
+static uint64_t fsUsed = 0, fsTotal = 0;     // cached by listFiles()
+static uint8_t  prevMode = UI_DESK;          // where Esc / Help / Files return to
+static uint8_t  kbdLayout = KBD_LAYOUT;      // runtime keyboard layout
+// Desktop, wallpaper, settings, lock
+static uint8_t *wallBuf = nullptr;           // 792x272 1-bit (PSRAM), 1 = black
+static uint8_t  wallMode = WALL_BUILTIN;
+static bool     wallFileOk = false;
+static volatile bool wallReload = false;
+static uint8_t  deskSel = 0, setSel = 0;
+static bool     setConfirm = false;          // "press Y" pending in Settings
+static bool     locked = false;
+static uint8_t  autoLockMin = 0;             // 0 = off
+static uint8_t  lockFails = 0;
+static uint32_t lockUntil = 0;
+static char     inBuf[40];                   // shared text input (password dialogs, lock)
+static uint8_t  inLen = 0;
+static uint8_t  inPurpose = IN_PW_NEW1;
+static char     pwFirst[40];
+// Storage volumes: internal flash (LittleFS) or microSD (FAT)
+static fs::FS   *docFS = &LittleFS;
+static bool      sdMounted = false;
+static SPIClass  sdSPI(HSPI);
 
 // BLE
 static volatile uint8_t  bleState = BLE_IDLE;
@@ -205,6 +265,7 @@ static volatile bool     passkeyActive = false;
 static volatile uint32_t passkeyVal = 0;
 static volatile int      kbBattery = -1;
 static volatile bool     reqUnpair = false;
+static volatile bool     kbLost = false;          // link dropped: cancel key repeat
 static volatile int      numBonds = 0;
 static hid_field_t hidFields[8];
 static uint8_t     nHidFields = 0;
@@ -215,11 +276,15 @@ static uint8_t     prevKeys[4][16], prevN[4], prevRid[4], nPrev = 0;
 
 // Network
 static WebServer server(80);
-static uint8_t   wifiState = WF_OFF;
+static volatile uint8_t wifiState = WF_OFF;     // read by the BLE task
 static char      wifiIp[20] = "";
 static char      wifiErr[128] = "";
 static volatile uint8_t apClients = 0;
 static File      upFile;
+static uint32_t  upBytes = 0;
+static bool      upOk = false, upIsWall = false;
+static char      upName[40] = "";
+static char      upMsg[80] = "";                 // last upload result, shown on the device
 static Preferences prefs;
 
 /*===========================================================================
@@ -574,10 +639,47 @@ static uint32_t wordCount(void) {
  *=========================================================================*/
 static void docPath(const char *name, char *out, size_t n) { snprintf(out, n, "/docs/%s", name); }
 
+static inline bool volIsSD(void) { return docFS == (fs::FS *)&SD; }
+static const char *volName(void) { return volIsSD() ? "SD card" : "Internal flash"; }
+static const char *prefDocKey(void) { return volIsSD() ? "docS" : "doc"; }
+static const char *prefCurKey(void) { return volIsSD() ? "curS" : "cur"; }
+
+// Human-readable size: B, kB, MB or GB
+static void fmtSize(uint64_t b, char *out, size_t n) {
+  if (b < 1024ULL)                 snprintf(out, n, "%u B", (unsigned)b);
+  else if (b < 1024ULL * 1024)     snprintf(out, n, "%u kB", (unsigned)(b / 1024));
+  else if (b < 1024ULL * 1024 * 1024) snprintf(out, n, "%.1f MB", b / 1048576.0);
+  else                             snprintf(out, n, "%.1f GB", b / 1073741824.0);
+}
+
+/* Replace 'dst' with 'tmp'. littlefs rename() atomically overwrites; FAT does
+ * not, so on the SD card the old file is first moved to a hidden backup that
+ * loadDoc() can recover if power fails in between. */
+static bool fsReplace(const char *tmp, const char *dst, const char *name) {
+  if (!volIsSD()) return LittleFS.rename(tmp, dst);
+  char bak[64]; snprintf(bak, sizeof(bak), "/docs/.bak_%s", name);
+  if (SD.exists(bak)) SD.remove(bak);
+  if (SD.exists(dst) && !SD.rename(dst, bak)) return false;
+  if (!SD.rename(tmp, dst)) { SD.rename(bak, dst); return false; }
+  SD.remove(bak);
+  return true;
+}
+
+static bool mountSD(void) {
+  pinMode(SD_PWR, OUTPUT);
+  digitalWrite(SD_PWR, HIGH);
+  delay(20);
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  sdMounted = SD.begin(SD_CS, sdSPI, SD_SPI_HZ, "/sd", 5) && SD.cardType() != CARD_NONE;
+  if (sdMounted && !SD.exists("/docs")) SD.mkdir("/docs");
+  DBG("[SD] %s\n", sdMounted ? "mounted" : "not present");
+  return sdMounted;
+}
+
 static bool saveDoc(void) {
   uint32_t t0 = millis();
   char path[56]; docPath(docName, path, sizeof(path));
-  File f = LittleFS.open("/docs/.tmp", "w");
+  File f = docFS->open("/docs/.tmp", "w");
   if (!f) return false;
   uint8_t buf[512]; size_t k = 0;
   uint32_t len = docLen();
@@ -589,11 +691,11 @@ static bool saveDoc(void) {
   }
   if (k) f.write(buf, k);
   f.close();
-  bool ok = LittleFS.rename("/docs/.tmp", path);   // littlefs rename is atomic
+  bool ok = fsReplace("/docs/.tmp", path, docName);
   if (ok) {
     docDirty = false;
-    prefs.putString("doc", docName);
-    prefs.putUInt("cur", cursorPos);
+    prefs.putString(prefDocKey(), docName);
+    prefs.putUInt(prefCurKey(), cursorPos);
   }
   DBG("[FS] saved %s (%lu B) %s in %lu ms\n", path, (unsigned long)len, ok ? "OK" : "ERROR",
       (unsigned long)(millis() - t0));
@@ -605,7 +707,9 @@ static void loadDoc(const char *name) {
   xSemaphoreTake(docMutex, portMAX_DELAY);
   docClear();
   strlcpy(docName, name, sizeof(docName));
-  File f = LittleFS.open(path, "r");
+  char bak[64]; snprintf(bak, sizeof(bak), "/docs/.bak_%s", name);
+  if (!docFS->exists(path) && docFS->exists(bak)) docFS->rename(bak, path);   // recover
+  File f = docFS->open(path, "r");
   if (f) {
     uint8_t lead = 0;
     while (f.available()) {
@@ -626,8 +730,8 @@ static void loadDoc(const char *name) {
   docDirty = false;
   fixViewport();
   xSemaphoreGive(docMutex);
-  prefs.putString("doc", docName);
-  DBG("[FS] opened %s (%lu B)\n", path, (unsigned long)docLen());
+  prefs.putString(prefDocKey(), docName);
+  DBG("[FS] opened %s:%s (%lu B)\n", volName(), path, (unsigned long)docLen());
 }
 
 static void newDocName(char *out, size_t n) {
@@ -635,14 +739,14 @@ static void newDocName(char *out, size_t n) {
   for (int i = 1; i < 100; i++) {
     snprintf(out, n, "note%02d.txt", i);
     docPath(out, path, sizeof(path));
-    if (!LittleFS.exists(path)) return;
+    if (!docFS->exists(path)) return;
   }
   snprintf(out, n, "note%08lx.txt", (unsigned long)esp_random());
 }
 
 static void listFiles(void) {
   nFiles = 0;
-  File d = LittleFS.open("/docs");
+  File d = docFS->open("/docs");
   if (!d) return;
   File e;
   while ((e = d.openNextFile()) && nFiles < 24) {
@@ -652,10 +756,133 @@ static void listFiles(void) {
     e.close();
   }
   d.close();
-  fsUsed  = LittleFS.usedBytes();
-  fsTotal = LittleFS.totalBytes();
+  fsUsed  = volIsSD() ? SD.usedBytes()  : LittleFS.usedBytes();
+  fsTotal = volIsSD() ? SD.totalBytes() : LittleFS.totalBytes();
   if (fileSel >= nFiles) fileSel = nFiles ? nFiles - 1 : 0;
 }
+
+/*===========================================================================
+ *  SECTION 7b - WALLPAPER (BMP decoder with Floyd-Steinberg dithering)
+ *=========================================================================*/
+static inline uint32_t rd32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+static inline uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
+
+/* Decodes an uncompressed BMP (1/4/8/24/32 bpp, bottom-up or top-down) into
+ * the 792x272 1-bit wallpaper buffer. Larger images are centre-cropped and
+ * smaller ones centred; grey levels are converted with Floyd-Steinberg error
+ * diffusion. Returns false if the file is missing or unsupported. */
+static bool loadBmp(fs::FS &fs, const char *path, uint8_t *dst) {
+  File f = fs.open(path, "r");
+  if (!f) return false;
+  uint8_t h[54];
+  if (f.read(h, 54) != 54 || h[0] != 'B' || h[1] != 'M') { f.close(); return false; }
+  uint32_t off = rd32(h + 10), dib = rd32(h + 14);
+  int32_t  w = (int32_t)rd32(h + 18), ht = (int32_t)rd32(h + 22);
+  uint16_t bpp = rd16(h + 28);
+  uint32_t comp = rd32(h + 30), ncol = rd32(h + 46);
+  bool topDown = ht < 0; if (topDown) ht = -ht;
+  if (w <= 0 || ht <= 0 || w > 4096 || ht > 4096 ||
+      !(bpp == 1 || bpp == 4 || bpp == 8 || bpp == 24 || bpp == 32) ||
+      !(comp == 0 || (comp == 3 && bpp == 32))) { f.close(); return false; }
+  uint8_t pal[256];                                    // palette luminance
+  if (bpp <= 8) {
+    if (!ncol) ncol = 1u << bpp;
+    f.seek(14 + dib);
+    for (uint32_t i = 0; i < ncol && i < 256; i++) {
+      uint8_t q[4]; f.read(q, 4);
+      pal[i] = (q[2] * 77 + q[1] * 150 + q[0] * 29) >> 8;
+    }
+  }
+  uint32_t rowSize = ((uint32_t)bpp * w + 31) / 32 * 4;
+  uint8_t *row = (uint8_t *)ps_malloc(rowSize);
+  int16_t *e0 = (int16_t *)ps_calloc(SCR_W + 2, sizeof(int16_t));
+  int16_t *e1 = (int16_t *)ps_calloc(SCR_W + 2, sizeof(int16_t));
+  if (!row || !e0 || !e1) { free(row); free(e0); free(e1); f.close(); return false; }
+  memset(dst, 0, SCR_W / 8 * SCR_H);
+  int sx0 = w > SCR_W ? (w - SCR_W) / 2 : 0,  dx0 = w < SCR_W ? (SCR_W - w) / 2 : 0;
+  int sy0 = ht > SCR_H ? (ht - SCR_H) / 2 : 0, dy0 = ht < SCR_H ? (SCR_H - ht) / 2 : 0;
+  int nx = w < SCR_W ? w : SCR_W, ny = ht < SCR_H ? ht : SCR_H;
+  for (int y = 0; y < ny; y++) {
+    int sr = sy0 + y;
+    f.seek(off + (uint32_t)(topDown ? sr : (ht - 1 - sr)) * rowSize);
+    f.read(row, rowSize);
+    memset(e1, 0, (SCR_W + 2) * sizeof(int16_t));
+    for (int x = 0; x < nx; x++) {
+      int sx = sx0 + x, g;
+      switch (bpp) {
+        case 1:  g = pal[(row[sx >> 3] >> (7 - (sx & 7))) & 1]; break;
+        case 4:  g = pal[(row[sx >> 1] >> ((sx & 1) ? 0 : 4)) & 0x0F]; break;
+        case 8:  g = pal[row[sx]]; break;
+        case 24: { const uint8_t *p = row + sx * 3; g = (p[2] * 77 + p[1] * 150 + p[0] * 29) >> 8; } break;
+        default: { const uint8_t *p = row + sx * 4; g = (p[2] * 77 + p[1] * 150 + p[0] * 29) >> 8; } break;
+      }
+      int v = g + e0[x + 1];
+      int o = v < 128 ? 0 : 255;
+      int e = v - o;
+      if (!o) { int X = dx0 + x, Y = dy0 + y; dst[Y * (SCR_W / 8) + (X >> 3)] |= 0x80 >> (X & 7); }
+      e0[x + 2] += e * 7 / 16; e1[x] += e * 3 / 16; e1[x + 1] += e * 5 / 16; e1[x + 2] += e / 16;
+    }
+    int16_t *t = e0; e0 = e1; e1 = t;
+  }
+  free(row); free(e0); free(e1); f.close();
+  DBG("[WALL] %s %ldx%ld %u bpp loaded\n", path, (long)w, (long)ht, bpp);
+  return true;
+}
+
+// Looks for the wallpaper file on the active volume first, then on the other one.
+static void loadWallpaper(void) {
+  if (!wallBuf) return;
+  fs::FS &other = volIsSD() ? (fs::FS &)LittleFS : (fs::FS &)SD;
+  wallFileOk = loadBmp(*docFS, WALL_FILE_PATH, wallBuf) ||
+               ((volIsSD() || sdMounted) && loadBmp(other, WALL_FILE_PATH, wallBuf));
+  if (!wallFileOk) memcpy(wallBuf, wallpaper_builtin, sizeof(wallpaper_builtin));
+}
+
+static void drawWallpaper(void) {
+  if (wallMode == WALL_NONE) return;
+  const uint8_t *src = (wallMode == WALL_FILE && wallFileOk && wallBuf) ? wallBuf : wallpaper_builtin;
+  for (int y = 0; y < SCR_H; y++)
+    for (int xb = 0; xb < SCR_W / 8; xb++) {
+      uint8_t b = src[y * (SCR_W / 8) + xb];
+      if (b) for (int k = 0; k < 8; k++) if (b & (0x80 >> k)) px(xb * 8 + k, y, true);
+    }
+}
+
+/*===========================================================================
+ *  SECTION 7c - PASSWORD (privacy lock, salted iterated SHA-256 in NVS)
+ *=========================================================================*/
+static void pwHash(const char *pw, const uint8_t salt[16], uint8_t out[32]) {
+  uint8_t buf[16 + 40];
+  size_t n = strlen(pw);
+  memcpy(buf, salt, 16); memcpy(buf + 16, pw, n);
+  mbedtls_sha256(buf, 16 + n, out, 0);
+  uint8_t b2[32 + 16];
+  for (int i = 1; i < PW_HASH_ROUNDS; i++) {
+    memcpy(b2, out, 32); memcpy(b2 + 32, salt, 16);
+    mbedtls_sha256(b2, sizeof(b2), out, 0);
+  }
+}
+
+static bool pwIsSet(void) { return prefs.isKey("pwh"); }
+
+static void pwStore(const char *pw) {
+  uint8_t salt[16], h[32];
+  esp_fill_random(salt, sizeof(salt));
+  pwHash(pw, salt, h);
+  prefs.putBytes("pws", salt, 16);
+  prefs.putBytes("pwh", h, 32);
+}
+
+static bool pwCheck(const char *pw) {
+  uint8_t salt[16], h[32], ref[32];
+  if (prefs.getBytes("pws", salt, 16) != 16 || prefs.getBytes("pwh", ref, 32) != 32) return true;
+  pwHash(pw, salt, h);
+  uint8_t d = 0;
+  for (int i = 0; i < 32; i++) d |= h[i] ^ ref[i];       // constant-time compare
+  return d == 0;
+}
+
+static void pwClear(void) { prefs.remove("pwh"); prefs.remove("pws"); }
 
 /*===========================================================================
  *  SECTION 8 - RENDER
@@ -672,11 +899,10 @@ static void setStatus(const char *s, uint32_t ms = 2500) {
 }
 
 static void drawHeader(uint32_t words) {
-  char left[64], right[96];
+  char left[80], right[96];
   fillRect(0, 0, SCR_W, HDR_H, true);
 
-  const char *bt = (bleState == BLE_READY) ? "BT OK" :
-                   (bleState == BLE_CONNECTING) ? "BT ..." : "BT --";
+  const char *bt = (bleState == BLE_READY) ? "BT OK" : "BT --";
   char bat[16] = "";
   if (kbBattery >= 0) snprintf(bat, sizeof(bat), "  KB %d%%", kbBattery);
   if (statusMsg[0] && millis() < statusUntil)
@@ -761,10 +987,10 @@ static void renderFiles(void) {
   }
   if (!nFiles) text24C(y0 + 60, "(no files)");
 
-  char foot[96];
-  snprintf(foot, sizeof(foot), "Open doc: %lu of %lu kB max   |   Flash: %lu kB used of %lu kB",
-           (unsigned long)((docLen() + 1023) / 1024), (unsigned long)(gbCap / 1024),
-           (unsigned long)(fsUsed / 1024), (unsigned long)(fsTotal / 1024));
+  char foot[112], u[16], t[16];
+  fmtSize(fsUsed, u, sizeof(u)); fmtSize(fsTotal, t, sizeof(t));
+  snprintf(foot, sizeof(foot), "Open doc: %lu of %lu kB max   |   %s: %s used of %s",
+           (unsigned long)((docLen() + 1023) / 1024), (unsigned long)(gbCap / 1024), volName(), u, t);
   text16(SCR_W - TXT_X - strLen8(foot) * 8, SCR_H - 17, foot, true);
 }
 
@@ -777,28 +1003,27 @@ static void renderHelp(void) {
     "Ctrl+N      New document",
     "Ctrl+W      File transfer (WiFi hotspot)",
     "Ctrl+R      Full refresh (anti-ghosting)",
+    "Ctrl+L      Lock (if a password is set)",
+    "Ctrl+P      Markdown preview (read-only)",
     "Ctrl+H      This help",
-    "Ctrl+Home   Start of document",
-    "Ctrl+End    End of document",
-    "PgUp/PgDn   Page up / down",
-    "Esc         Cancel pending dead key",
+    "Ctrl+Home/End  Start / end of document",
+    "Esc         Desktop (or cancel dead key)",
     "",
     "Press any key to return",
   };
   static const char *R[] = {
+    "DESKTOP: arrows + Enter, or keys 1-7",
     "FILE LIST (Ctrl+O)",
-    "Up/Down     Select      Enter  Open",
-    "N           New         R      Rename",
-    "D / Del     Delete (Y confirms)",
-    "Esc         Back to the editor",
-    "",
-    "STORAGE: internal flash, LittleFS /docs, UTF-8",
+    "Up/Down Select  Enter Open  N New",
+    "R Rename   D/Del Delete (Y confirms)",
+    "PREVIEW: arrows PgUp/PgDn Space Home/End",
     "TRANSFER: join WiFi " AP_SSID,
     "  password " AP_PASS,
     "  then browse http://192.168.4.1",
     "",
-    "BUTTONS: MENU refresh  OK save  UP/DN page",
-    "         EXIT held 3 s: forget keyboard",
+    "BUTTONS: EXIT desktop   OK save",
+    "  MENU refresh   UP/DN page",
+    "  EXIT held 3 s: forget keyboard",
   };
   for (unsigned i = 0; i < sizeof(L) / sizeof(L[0]); i++)
     text16(TXT_X, TXT_Y + i * 18, L[i], true);
@@ -825,8 +1050,12 @@ static void renderXfer(void) {
     char st[64];
     snprintf(st, sizeof(st), "Hotspot up on channel %d   |   PCs connected: %u", AP_CHANNEL, apClients);
     text16(TXT_X, y0 + 124, st, true);
-    text16(TXT_X, y0 + 146, "Download, upload (.txt/.md) or delete notes from the web page.", true);
-    text16(TXT_X, y0 + 164, "The keyboard stays connected: WiFi and BLE share the radio.", true);
+    text16(TXT_X, y0 + 146, "Download, upload (.txt/.md, .bmp wallpaper) or delete from the web page.", true);
+    char lu[96]; snprintf(lu, sizeof(lu), "Last upload: %s", upMsg[0] ? upMsg : "-");
+    text16(TXT_X, y0 + 164, lu, true);
+    text16(TXT_X, y0 + 182, bleState == BLE_READY
+             ? "Keyboard link relaxed while WiFi is on. Esc / Ctrl+W: close."
+             : "Keyboard reconnection paused while WiFi is on. EXIT button: close.", true);
   } else if (wifiState == WF_STARTING || wifiState == WF_OFF) {
     text24C(y0 + 50, "Starting WiFi hotspot...");
   } else {
@@ -837,6 +1066,103 @@ static void renderXfer(void) {
     else text24C(y0 + 55, e1);
     text16(TXT_X, y0 + 130, "Press Esc and try Ctrl+W again. If it persists, send the [WIFI] serial log lines.", true);
   }
+}
+
+// White panel with a 2 px border and a 4 px drop shadow, drawn over the wallpaper
+static void panel(int x, int y, int w, int h) {
+  fillRect(x + 4, y + 4, w, h, true);
+  fillRect(x, y, w, h, false);
+  fillRect(x, y, w, 2, true); fillRect(x, y + h - 2, w, 2, true);
+  fillRect(x, y, 2, h, true); fillRect(x + w - 2, y, 2, h, true);
+}
+
+static const char *DESK_ITEMS[] = { "Continue writing", "New document", "Documents",
+                                    "File transfer", "Settings", "Help", "Lock" };
+static uint8_t deskCount(void) { return pwIsSet() ? 7 : 6; }
+
+static void renderDesk(void) {
+  if (deskSel >= deskCount()) deskSel = 0;
+  drawWallpaper();
+  drawHeader(wordCount());
+  const int px0 = 20, py0 = 30, pw = 300, ph = 232;
+  panel(px0, py0, pw, ph);
+  fillRect(px0, py0, pw, 24, true);
+  text16(px0 + 10, py0 + 4, "MENU", false);
+  char line[48];
+  for (uint8_t i = 0; i < deskCount(); i++) {
+    int y = py0 + 30 + i * 25;
+    snprintf(line, sizeof(line), "%u  %s", i + 1, DESK_ITEMS[i]);
+    if (i == deskSel) { fillRect(px0 + 6, y - 1, pw - 12, 24, true); text24(px0 + 12, y, line, false); }
+    else text24(px0 + 12, y, line, true);
+  }
+  char sz[16]; fmtSize(docLen(), sz, sizeof(sz));
+  snprintf(line, sizeof(line), "Last: %.24s (%s)", docName, sz);          // fits the panel
+  text16(px0 + 10, py0 + ph - 20, line, true);
+}
+
+static const char *LAYOUT_NAMES[] = { "Latin America", "Spain", "US" };
+static const char *WALL_NAMES[]   = { "Built-in", "File " WALL_FILE_PATH, "None" };
+
+static void renderSettings(void) {
+  drawHeader(wordCount());
+  text24(TXT_X, TXT_Y, "SETTINGS", true);
+  text16(TXT_X + 120, TXT_Y + 5,
+         setConfirm ? "Press Y to confirm, any other key to cancel"
+                    : "Up/Down: select   Enter: change   Esc: back", true);
+  hLine(TXT_X, SCR_W - TXT_X, TXT_Y + 27, true);
+  char val[48], line[80];
+  for (uint8_t i = 0; i < 7; i++) {
+    const char *lab = "";
+    switch (i) {
+      case 0: lab = "Password";        snprintf(val, sizeof(val), "%s", pwIsSet() ? "set (Enter: change/remove)" : "not set (Enter: set)"); break;
+      case 1: lab = "Auto-lock";       if (autoLockMin) snprintf(val, sizeof(val), "%u min", autoLockMin); else snprintf(val, sizeof(val), "off"); break;
+      case 2: lab = "Keyboard layout"; snprintf(val, sizeof(val), "%s", LAYOUT_NAMES[kbdLayout]); break;
+      case 3: lab = "Storage";         snprintf(val, sizeof(val), "%s%s", volName(), sdMounted ? "" : " (no SD card)"); break;
+      case 4: lab = "Copy documents";  snprintf(val, sizeof(val), sdMounted ? "all to %s" : "needs an SD card", volIsSD() ? "internal flash" : "SD card"); break;
+      case 5: lab = "Wallpaper";       snprintf(val, sizeof(val), "%s%s", WALL_NAMES[wallMode], (wallMode == WALL_FILE && !wallFileOk) ? " (missing)" : ""); break;
+      case 6: lab = "Forget keyboard"; snprintf(val, sizeof(val), "pair again"); break;
+    }
+    snprintf(line, sizeof(line), "%-16s %s", lab, val);
+    int y = TXT_Y + 32 + i * 30;
+    if (i == setSel) { fillRect(TXT_X - 4, y - 1, SCR_W - 2 * TXT_X + 8, 25, true); text24(TXT_X, y, line, false); }
+    else text24(TXT_X, y, line, true);
+  }
+}
+
+static void drawMaskedField(int x, int y, int w) {
+  fillRect(x, y, w, 30, false);
+  hLine(x, x + w, y + 30, true);
+  char shown[42];
+  for (uint8_t i = 0; i < inLen; i++) shown[i] = '*';
+  shown[inLen] = '_'; shown[inLen + 1] = 0;
+  text24(x + 6, y + 3, shown, true);
+}
+
+static void renderInput(void) {
+  drawWallpaper();
+  drawHeader(wordCount());
+  panel(146, 64, 500, 150);
+  const char *t = inPurpose == IN_PW_OLD ? "Current password" :
+                  inPurpose == IN_PW_NEW1 ? "New password (empty = remove)" : "Repeat new password";
+  text24(166, 80, t, true);
+  drawMaskedField(166, 120, 460);
+  text16(166, 180, "Enter: accept    Esc: cancel", true);
+}
+
+static void renderLock(void) {
+  drawWallpaper();
+  fillRect(0, 0, SCR_W, HDR_H, true);                     // no document name while locked
+  text16(0, 1, " ELECTGPL WRITER", false);
+  const char *bt = (bleState == BLE_READY) ? "BT OK " : "BT -- ";
+  text16(SCR_W - strLen8(bt) * 8, 1, bt, false);
+  panel(146, 64, 500, 150);
+  fillRect(146, 64, 500, 26, true);
+  text24(166, 66, "LOCKED", false);
+  drawMaskedField(166, 106, 460);
+  char m[64] = "Type the password and press Enter";
+  if (millis() < lockUntil) snprintf(m, sizeof(m), "Too many attempts: wait %lu s", (unsigned long)((lockUntil - millis()) / 1000 + 1));
+  else if (lockFails) snprintf(m, sizeof(m), "Wrong password (%u)", lockFails);
+  text16(166, 170, m, true);
 }
 
 static void renderPair(void) {
@@ -855,11 +1181,398 @@ static void renderPair(void) {
   }
 }
 
+/*===========================================================================
+ *  SECTION 8b - MARKDOWN PREVIEW (read-only, Ctrl+P)
+ *  Block level: # ## ### headings, paragraphs (soft breaks joined, two
+ *  trailing spaces = hard break), - * + and 1. lists with nesting, > quotes,
+ *  ``` fenced code, | tables (verbatim), --- rules.
+ *  Inline: **bold**, *italic*, ***both***, ~~strike~~, `code`, [link](url),
+ *  ![image](src), \ escapes. Each character cell carries its attributes.
+ *=========================================================================*/
+#define A_BOLD 0x01
+#define A_ITAL 0x02
+#define A_CODE 0x04
+#define A_UNDR 0x08
+#define A_STRK 0x10
+#define A_BULL 0x20
+#define MD_W   (COLS - 1)           // columns available (last one for the scroll bar)
+
+static uint16_t *mdCells = nullptr; static uint32_t mdCellsN = 0, mdCellsCap = 0;
+static mdline_t *mdLines = nullptr; static uint32_t mdLinesN = 0, mdLinesCap = 0;
+static uint16_t *mdPara  = nullptr; static uint32_t mdParaN  = 0, mdParaCap  = 0;
+static char     *mdRaw   = nullptr; static uint32_t mdRawN   = 0, mdRawCap   = 0;
+static uint32_t  mdTop = 0;
+static bool      mdOom = false;
+// open paragraph context
+static bool     pOpen = false, pHard = false;
+static uint8_t  pKind = MD_TEXT, pIndent = 0, pDepth = 0;
+static uint16_t pMarker[8];
+static uint8_t  pMarkerN = 0;
+static uint32_t pSrc = 0;
+
+static bool mdGrow(void **p, uint32_t *cap, uint32_t need, size_t elem) {
+  if (need <= *cap) return true;
+  uint32_t nc = *cap ? *cap : 1024;
+  while (nc < need) nc *= 2;
+  void *q = ps_realloc(*p, (size_t)nc * elem);
+  if (!q) { mdOom = true; return false; }
+  *p = q; *cap = nc;
+  return true;
+}
+
+static void rawPush(char c) {
+  if (mdGrow((void **)&mdRaw, &mdRawCap, mdRawN + 1, 1)) mdRaw[mdRawN++] = c;
+}
+static void paraPush(uint8_t c, uint8_t at) {
+  if (mdGrow((void **)&mdPara, &mdParaCap, mdParaN + 1, 2)) mdPara[mdParaN++] = c | (at << 8);
+}
+
+static void mdEmit(uint8_t kind, uint8_t indent, uint8_t depth, uint32_t src,
+                   const uint16_t *c, uint32_t n) {
+  if (!mdGrow((void **)&mdLines, &mdLinesCap, mdLinesN + 1, sizeof(mdline_t))) return;
+  if (!mdGrow((void **)&mdCells, &mdCellsCap, mdCellsN + n + 1, 2)) return;
+  mdline_t &L = mdLines[mdLinesN++];
+  L.c0 = mdCellsN; L.n = n; L.kind = kind; L.indent = indent; L.depth = depth; L.src = src;
+  memcpy(mdCells + mdCellsN, c, n * 2);
+  mdCellsN += n;
+}
+
+static void mdGap(uint32_t src) {
+  if (mdLinesN && mdLines[mdLinesN - 1].kind != MD_GAP) mdEmit(MD_GAP, 0, 0, src, nullptr, 0);
+}
+
+// Word-wraps a cell run: the first line starts with 'pre' (bullet or number),
+// continuation lines get a hanging indent of the same width.
+static void mdWrap(uint8_t kind, uint8_t indent, uint8_t depth, uint32_t src,
+                   const uint16_t *pre, uint8_t preN, const uint16_t *c, uint32_t n, int width) {
+  uint16_t line[MD_W + 8];
+  uint32_t i = 0;
+  bool first = true;
+  do {
+    int ln = 0;
+    if (first) for (uint8_t k = 0; k < preN; k++) line[ln++] = pre[k];
+    int avail = width - preN;
+    if (avail < 8) avail = 8;
+    while (i < n && (c[i] & 0xFF) == ' ') i++;                   // no leading spaces
+    uint32_t start = i, lastSp = UINT32_MAX;
+    while (i < n && (int)(i - start) < avail) {
+      uint8_t ch = c[i] & 0xFF;
+      if (ch == '\n') break;
+      if (ch == ' ') lastSp = i;
+      i++;
+    }
+    uint32_t end = i;
+    if (i < n && (c[i] & 0xFF) != '\n' && (c[i] & 0xFF) != ' ' && lastSp != UINT32_MAX && lastSp > start)
+      end = i = lastSp;                                           // break at the last space
+    for (uint32_t k = start; k < end; k++) line[ln++] = c[k];
+    if (i < n && (c[i] & 0xFF) == '\n') i++;                      // hard break consumed
+    mdEmit(kind, first ? indent : indent + preN, depth, src, line, ln);
+    first = false;
+  } while (i < n);
+}
+
+static bool isPunct(char c) { return c && strchr("\\`*_{}[]()#+-.!|~>", c); }
+
+// Inline markup -> attributed cells (mdPara)
+static void mdInline(const char *s, uint32_t n, uint8_t base) {
+  mdParaN = 0;
+  uint8_t at = base;
+  uint32_t i = 0;
+  while (i < n) {
+    char c = s[i];
+    if (c == '\\' && i + 1 < n && isPunct(s[i + 1])) { paraPush(s[i + 1], at); i += 2; continue; }
+    if (at & A_CODE) {
+      if (c == '`') { at &= ~A_CODE; i++; } else { paraPush(c, at); i++; }
+      continue;
+    }
+    if (c == '`' && memchr(s + i + 1, '`', n - i - 1)) { at |= A_CODE; i++; continue; }
+    if (c == '*' || c == '_') {
+      bool dbl = (i + 1 < n && s[i + 1] == c);
+      uint8_t flag = dbl ? A_BOLD : A_ITAL;
+      uint32_t ml = dbl ? 2 : 1;
+      bool prevAl = i > 0 && isalnum((unsigned char)s[i - 1]);
+      bool nextAl = i + ml < n && isalnum((unsigned char)s[i + ml]);
+      if (c == '_' && prevAl && nextAl) { paraPush(c, at); i++; continue; }   // snake_case
+      if (at & flag) { at &= ~flag; i += ml; continue; }                     // closing
+      bool nextSp = (i + ml >= n) || s[i + ml] == ' ';
+      bool closes = false;
+      for (uint32_t j = i + ml + 1; j + ml <= n; j++)
+        if (s[j] == c && (dbl ? (j + 1 < n && s[j + 1] == c) : !(j + 1 < n && s[j + 1] == c && !(at & A_BOLD)))) { closes = true; break; }
+      if (!nextSp && closes) { at |= flag; i += ml; continue; }
+      paraPush(c, at); i++; continue;
+    }
+    if (c == '~' && i + 1 < n && s[i + 1] == '~') {
+      if (at & A_STRK) { at &= ~A_STRK; i += 2; continue; }
+      bool closes = false;
+      for (uint32_t j = i + 2; j + 1 < n; j++) if (s[j] == '~' && s[j + 1] == '~') { closes = true; break; }
+      if (closes) { at |= A_STRK; i += 2; continue; }
+    }
+    if (c == '[' || (c == '!' && i + 1 < n && s[i + 1] == '[')) {
+      bool img = (c == '!');
+      uint32_t o = i + (img ? 2 : 1), cb = o;
+      while (cb < n && s[cb] != ']') cb++;
+      if (cb + 1 < n && s[cb + 1] == '(') {
+        uint32_t cp = cb + 2;
+        while (cp < n && s[cp] != ')') cp++;
+        if (cp < n) {
+          if (img) { const char *t = "[image: "; while (*t) paraPush(*t++, at); }
+          for (uint32_t k = o; k < cb; k++) paraPush(s[k], img ? at : (at | A_UNDR));
+          if (img) paraPush(']', at);
+          i = cp + 1;
+          continue;
+        }
+      }
+    }
+    paraPush(c, at); i++;
+  }
+}
+
+static void mdFlush(void) {
+  if (!pOpen) return;
+  mdInline(mdRaw, mdRawN, 0);
+  int width = MD_W - pIndent - (pKind == MD_QUOTE ? 2 * pDepth : 0);
+  mdWrap(pKind, pIndent, pDepth, pSrc, pMarker, pMarkerN, mdPara, mdParaN, width);
+  pOpen = false; pHard = false; mdRawN = 0; pMarkerN = 0;
+}
+
+static void mdOpen(uint8_t kind, uint8_t indent, uint8_t depth, uint32_t src) {
+  mdFlush();
+  pOpen = true; pKind = kind; pIndent = indent; pDepth = depth; pSrc = src;
+  mdRawN = 0; pMarkerN = 0; pHard = false;
+}
+
+static void mdAppend(const char *t, int n) {
+  while (n > 0 && t[n - 1] == ' ') { if (n >= 2 && t[n - 2] == ' ') pHard = true; n--; }
+  if (mdRawN) rawPush(' ');
+  for (int k = 0; k < n; k++) rawPush(t[k]);
+  if (pHard) { rawPush('\n'); pHard = false; }
+}
+
+static void mdVerbatim(uint8_t kind, uint32_t src, const char *t, int n) {
+  int width = MD_W - (kind == MD_CODE ? 2 : 0);
+  uint16_t line[MD_W + 8];
+  int i = 0;
+  do {
+    int ln = 0;
+    while (i < n && ln < width) line[ln++] = (uint8_t)t[i++];
+    mdEmit(kind, 0, 0, src, line, ln);
+  } while (i < n);
+}
+
+static void mdLine(const char *line, int ll, uint32_t src, bool *fence) {
+  int sp = 0;
+  while (sp < ll && line[sp] == ' ') sp++;
+  const char *t = line + sp;
+  int tl = ll - sp;
+  if (*fence) {
+    if (tl >= 3 && !strncmp(t, "```", 3)) { *fence = false; mdGap(src); }
+    else mdVerbatim(MD_CODE, src, line, ll);
+    return;
+  }
+  if (tl >= 3 && !strncmp(t, "```", 3)) { mdFlush(); *fence = true; return; }
+  if (tl == 0) { mdFlush(); mdGap(src); return; }
+  if (t[0] == '#') {                                              // heading
+    int h = 0; while (h < tl && t[h] == '#') h++;
+    if (h <= 6 && (h == tl || t[h] == ' ')) {
+      mdFlush();
+      const char *x = t + h; int xl = tl - h;
+      while (xl && *x == ' ') { x++; xl--; }
+      while (xl && (x[xl - 1] == '#' || x[xl - 1] == ' ')) xl--;
+      uint8_t kind = h == 1 ? MD_H1 : h == 2 ? MD_H2 : MD_H3;
+      mdInline(x, xl, A_BOLD);
+      mdWrap(kind, 0, 0, src, nullptr, 0, mdPara, mdParaN, kind == MD_H1 ? MD_W / 2 : MD_W);
+      return;
+    }
+  }
+  if (tl >= 3 && (t[0] == '-' || t[0] == '*' || t[0] == '_')) {  // horizontal rule
+    int cnt = 0; bool ok = true;
+    for (int k = 0; k < tl; k++) { if (t[k] == t[0]) cnt++; else if (t[k] != ' ') { ok = false; break; } }
+    if (ok && cnt >= 3) { mdFlush(); mdEmit(MD_HR, 0, 0, src, nullptr, 0); return; }
+  }
+  if (t[0] == '|') { mdFlush(); mdVerbatim(MD_PRE, src, t, tl); return; }     // table row
+  if (t[0] == '>') {                                              // block quote
+    int d = 0, k = 0;
+    while (k < tl && (t[k] == '>' || t[k] == ' ')) { if (t[k] == '>') d++; k++; }
+    if (d > 4) d = 4;
+    if (!pOpen || pKind != MD_QUOTE || pDepth != d) mdOpen(MD_QUOTE, 0, d, src);
+    mdAppend(t + k, tl - k);
+    return;
+  }
+  uint8_t lvl = sp / 2; if (lvl > 6) lvl = 6;
+  if ((t[0] == '-' || t[0] == '*' || t[0] == '+') && tl > 1 && t[1] == ' ') {   // bullet
+    mdOpen(MD_TEXT, lvl * 2, 0, src);
+    pMarker[0] = ' ' | (A_BULL << 8); pMarker[1] = ' '; pMarkerN = 2;
+    mdAppend(t + 2, tl - 2);
+    return;
+  }
+  int d = 0;
+  while (d < tl && d < 4 && isdigit((unsigned char)t[d])) d++;
+  if (d && d + 1 < tl && (t[d] == '.' || t[d] == ')') && t[d + 1] == ' ') {     // numbered
+    mdOpen(MD_TEXT, lvl * 2, 0, src);
+    for (int k = 0; k <= d; k++) pMarker[pMarkerN++] = (uint8_t)t[k];
+    pMarker[pMarkerN++] = ' ';
+    mdAppend(t + d + 2, tl - d - 2);
+    return;
+  }
+  if (!pOpen) mdOpen(MD_TEXT, 0, 0, src);                        // paragraph / lazy continuation
+  mdAppend(t, tl);
+}
+
+static void mdBuild(void) {
+  mdCellsN = mdLinesN = 0; mdRawN = 0; mdOom = false;
+  pOpen = false; pHard = false; pMarkerN = 0;
+  static char line[1024];
+  uint32_t len = docLen(), pos = 0;
+  bool fence = false;
+  for (;;) {
+    uint32_t e = pos;
+    while (e < len && docAt(e) != '\n') e++;
+    int ll = (e - pos) < sizeof(line) - 1 ? (int)(e - pos) : (int)sizeof(line) - 1;
+    for (int k = 0; k < ll; k++) line[k] = docAt(pos + k);
+    line[ll] = 0;
+    mdLine(line, ll, pos, &fence);
+    if (e >= len) break;
+    pos = e + 1;
+  }
+  mdFlush();
+  while (mdLinesN && mdLines[mdLinesN - 1].kind == MD_GAP) mdLinesN--;
+  DBG("[MD] %lu display lines, %lu cells%s\n", (unsigned long)mdLinesN,
+      (unsigned long)mdCellsN, mdOom ? " (OUT OF MEMORY, truncated)" : "");
+}
+
+static int mdHeight(uint8_t k) {
+  switch (k) {
+    case MD_H1: return 54;  case MD_H2: return 32; case MD_H3: return 28;
+    case MD_HR: return 14;  case MD_GAP: return 10; default: return 24;
+  }
+}
+
+static const int MD_Y0 = HDR_H + 6;
+
+static uint32_t mdMaxTop(void) {
+  int h = 0;
+  uint32_t i = mdLinesN;
+  while (i > 0 && h + mdHeight(mdLines[i - 1].kind) <= SCR_H - MD_Y0) { h += mdHeight(mdLines[i - 1].kind); i--; }
+  return i;
+}
+
+static void mdGlyph(int x, int y, uint16_t cell, uint8_t scale) {
+  uint8_t c = cell & 0xFF, at = cell >> 8;
+  int w = CELL_W * scale, h = CELL_H * scale;
+  if (at & A_BULL) {                                              // bullet: filled disc
+    int cx = x + w / 2, cy = y + h / 2 + scale, r = 3 * scale;
+    for (int dy = -r; dy <= r; dy++)
+      for (int dx = -r; dx <= r; dx++) if (dx * dx + dy * dy <= r * r) px(cx + dx, cy + dy, true);
+    return;
+  }
+  bool inv = at & A_CODE;
+  if (inv) fillRect(x, y + scale, w, h - 2 * scale, true);
+  const uint16_t *g = spleen12x24[glyphIdx(c)];
+  for (int r = 0; r < CELL_H; r++) {
+    uint16_t bits = g[r];
+    if (!bits) continue;
+    int sh = (at & A_ITAL) ? (CELL_H - 1 - r) / 8 : 0;             // italic shear, 0..2 px
+    for (int col = 0; col < CELL_W; col++) {
+      if (!(bits & (0x800 >> col))) continue;
+      int X = x + (col + sh) * scale, Y = y + r * scale;
+      fillRect(X, Y, scale, scale, !inv);
+      if (at & A_BOLD) fillRect(X + 1, Y, scale, scale, !inv);    // double strike
+    }
+  }
+  if (at & A_UNDR) hLine(x, x + w - 1, y + h - 2 * scale, !inv);
+  if (at & A_STRK) hLine(x, x + w - 1, y + h / 2 + scale, !inv);
+}
+
+static void renderPreview(void) {
+  fillRect(0, 0, SCR_W, HDR_H, true);
+  char l[64], r[64];
+  snprintf(l, sizeof(l), " PREVIEW  %s", docName);
+  text16(0, 1, l, false);
+  uint32_t mt = mdMaxTop();
+  snprintf(r, sizeof(r), "%u%%   Ctrl+P / Esc: edit ",
+           (unsigned)(mt ? (uint64_t)mdTop * 100 / mt : 100));
+  text16(SCR_W - strLen8(r) * 8, 1, r, false);
+
+  int y = MD_Y0;
+  for (uint32_t i = mdTop; i < mdLinesN; i++) {
+    const mdline_t &L = mdLines[i];
+    int h = mdHeight(L.kind);
+    if (y + h > SCR_H) break;
+    int x = TXT_X + L.indent * CELL_W;
+    uint8_t scale = 1, force = 0;
+    switch (L.kind) {
+      case MD_H1: scale = 2; force = A_BOLD; fillRect(TXT_X, y + 50, SCR_W - 2 * TXT_X, 2, true); break;
+      case MD_H2: force = A_BOLD; hLine(TXT_X, SCR_W - TXT_X, y + 28, true); break;
+      case MD_H3: force = A_BOLD; break;
+      case MD_QUOTE:
+        for (int d = 0; d < L.depth; d++) fillRect(TXT_X + d * 2 * CELL_W + 2, y, 3, h, true);
+        x += L.depth * 2 * CELL_W; break;
+      case MD_CODE: fillRect(TXT_X + 2, y, 3, h, true); x = TXT_X + 2 * CELL_W; break;
+      case MD_HR:   fillRect(TXT_X, y + 6, SCR_W - 2 * TXT_X - 8, 2, true); break;
+      default: break;
+    }
+    for (uint16_t k = 0; k < L.n; k++)
+      mdGlyph(x + k * CELL_W * scale, y, mdCells[L.c0 + k] | (force << 8), scale);
+    y += h;
+  }
+  if (mdLinesN == 0) text24C(120, "(empty document)");
+  // scroll bar
+  const int sx = SCR_W - 6, sy0 = MD_Y0, sh = SCR_H - MD_Y0 - 4;
+  for (int yy = sy0; yy < sy0 + sh; yy += 4) px(sx + 1, yy, true);
+  if (mt > 0) {
+    int ty = sy0 + (int)((uint64_t)(sh - 16) * mdTop / mt);
+    fillRect(sx, ty, 3, 16, true);
+  }
+}
+
+static void startPreview(void) {
+  xSemaphoreTake(docMutex, portMAX_DELAY);
+  mdBuild();
+  mdTop = 0;                                           // open at the cursor's paragraph
+  for (uint32_t i = 0; i < mdLinesN; i++) if (mdLines[i].src <= cursorPos) mdTop = i; else break;
+  uint32_t mt = mdMaxTop();
+  if (mdTop > mt) mdTop = mt;
+  uiMode = UI_PREVIEW;
+  xSemaphoreGive(docMutex);
+  if (mdOom) setStatus("Preview truncated: out of memory", 4000);
+}
+
+static void handlePreviewKey(uint8_t u, bool ctrl) {
+  uint32_t mt = mdMaxTop();
+  int area = SCR_H - MD_Y0;
+  switch (u) {
+    case 0x29: uiMode = UI_EDIT; return;                               // Esc
+    case 0x13: if (ctrl) uiMode = UI_EDIT; return;                     // Ctrl+P
+    case 0x51: if (mdTop < mt) mdTop++; return;                        // down
+    case 0x52: if (mdTop) mdTop--; return;                             // up
+    case 0x4E: case 0x2C: {                                            // PgDn / Space
+      int h = 0;
+      while (mdTop < mt && h + mdHeight(mdLines[mdTop].kind) <= area - 24) h += mdHeight(mdLines[mdTop++].kind);
+      return;
+    }
+    case 0x4B: {                                                       // PgUp
+      int h = 0;
+      while (mdTop > 0 && h + mdHeight(mdLines[mdTop - 1].kind) <= area - 24) h += mdHeight(mdLines[--mdTop].kind);
+      return;
+    }
+    case 0x4A: mdTop = 0; return;                                      // Home
+    case 0x4D: mdTop = mt; return;                                     // End
+  }
+}
+
+static bool pairShown = false;               // last frame was the pairing screen
+
 static void renderFrame(void) {
   paintClear();
   bool needPair = passkeyActive ||
                   (bleState != BLE_READY && numBonds == 0);
+  pairShown = needPair;
   if (needPair)               renderPair();
+  else if (locked)            renderLock();
+  else if (uiMode == UI_DESK)  renderDesk();
+  else if (uiMode == UI_SETTINGS) renderSettings();
+  else if (uiMode == UI_INPUT) renderInput();
+  else if (uiMode == UI_PREVIEW) renderPreview();
   else if (uiMode == UI_FILES) renderFiles();
   else if (uiMode == UI_HELP)  renderHelp();
   else if (uiMode == UI_XFER)  renderXfer();
@@ -870,25 +1583,31 @@ static void renderFrame(void) {
 // pile up; when BUSY is released the most recent state gets drawn.
 static void displayTask(void *) {
   uint32_t done = 0, partials = 0;
+  bool idleCleaned = false;              // the 60 s idle refresh runs once per idle period
   for (;;) {
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
     uint32_t now  = millis();
     uint32_t idle = now - lastInputMs;
+    if (idle < CLEAN_IDLE_MS) idleCleaned = false;
     bool want  = (viewSeq != done);
-    bool clean = cleanRequest ||
+    bool idleClean = (partials > 0 && idle >= CLEAN_IDLE_MS && !idleCleaned);
+    bool clean = cleanRequest || idleClean ||
                  (partials >= CLEAN_HARD_PARTIALS) ||
-                 (partials >= CLEAN_SOFT_PARTIALS && idle >= CLEAN_PAUSE_MS) ||
-                 (partials > 0 && idle >= CLEAN_IDLE_MS);
+                 (partials >= CLEAN_SOFT_PARTIALS && idle >= CLEAN_PAUSE_MS);
     if (!want && !clean) continue;
 
     uint32_t seq = viewSeq;
     uint32_t t0 = millis();
+    bool wasPair = pairShown;
     xSemaphoreTake(docMutex, portMAX_DELAY);
     renderFrame();
     xSemaphoreGive(docMutex);
     uint32_t t1 = millis();
+    // Entering or leaving the pairing screen replaces almost every pixel:
+    // do a full refresh so no ghost of the previous layout remains.
+    if (wasPair != pairShown && done != 0) clean = true;
 
-    if (clean) { cleanRequest = false; epdFullClear(); partials = 0; }
+    if (clean) { cleanRequest = false; epdFullClear(); partials = 0; if (idleClean) idleCleaned = true; }
     epdPush();
     if (!clean) partials++;
     done = seq;
@@ -956,14 +1675,14 @@ static uint8_t deadChar(uint8_t dk) {
 // Returns the Latin-1 char or a dead-key code (1..4); 0 = nothing
 static uint8_t translate(uint8_t u, bool shift, bool altgr) {
   if (u >= 0x04 && u <= 0x1D) {
-    if (altgr) return (KBD_LAYOUT == LAYOUT_LATAM && u == 0x14) ? '@' : 0;   // AltGr+Q
+    if (altgr) return (kbdLayout == LAYOUT_LATAM && u == 0x14) ? '@' : 0;    // AltGr+Q
     char c = 'a' + (u - 0x04);
     return (shift ^ capsLock) ? (c - 32) : c;
   }
   if (u == 0x2C) return ' ';
   const keymap_t *km; size_t n;
-  if (KBD_LAYOUT == LAYOUT_ES)      { km = KM_ES;    n = sizeof(KM_ES) / sizeof(km[0]); }
-  else if (KBD_LAYOUT == LAYOUT_US) { km = KM_US;    n = sizeof(KM_US) / sizeof(km[0]); }
+  if (kbdLayout == LAYOUT_ES)       { km = KM_ES;    n = sizeof(KM_ES) / sizeof(km[0]); }
+  else if (kbdLayout == LAYOUT_US)  { km = KM_US;    n = sizeof(KM_US) / sizeof(km[0]); }
   else                              { km = KM_LATAM; n = sizeof(KM_LATAM) / sizeof(km[0]); }
   for (size_t i = 0; i < n; i++) {
     if (km[i].u != u) continue;
@@ -998,6 +1717,7 @@ static void startFiles(void) {
   if (docDirty) saveDoc();
   listFiles();
   for (uint8_t i = 0; i < nFiles; i++) if (!strcmp(fileNames[i], docName)) fileSel = i;
+  if (uiMode != UI_FILES) prevMode = uiMode;
   uiMode = UI_FILES;
 }
 
@@ -1026,10 +1746,10 @@ static void doRename(void) {
   docPath(fileNames[fileSel], oldP, sizeof(oldP));
   docPath(nn.c_str(), newP, sizeof(newP));
   if (!strcmp(oldP, newP)) { fileAction = FA_NONE; return; }
-  if (LittleFS.exists(newP)) { setStatus("Name already in use"); return; }
+  if (docFS->exists(newP)) { setStatus("Name already in use"); return; }
   bool isOpen = !strcmp(fileNames[fileSel], docName);
   if (isOpen && docDirty) saveDoc();
-  if (!LittleFS.rename(oldP, newP)) { setStatus("ERROR renaming"); return; }
+  if (!docFS->rename(oldP, newP)) { setStatus("ERROR renaming"); return; }
   if (isOpen) { strlcpy(docName, nn.c_str(), sizeof(docName)); prefs.putString("doc", docName); }
   listFiles();
   for (uint8_t i = 0; i < nFiles; i++) if (nn == fileNames[i]) fileSel = i;
@@ -1042,7 +1762,7 @@ static void doDelete(void) {
   char path[56]; docPath(fileNames[fileSel], path, sizeof(path));
   bool isOpen = !strcmp(fileNames[fileSel], docName);
   if (isOpen) docDirty = false;                 // do not let autosave recreate it
-  LittleFS.remove(path);
+  docFS->remove(path);
   listFiles();
   if (isOpen) {
     if (nFiles) loadDoc(fileNames[0]);
@@ -1074,7 +1794,7 @@ static void handleFilesKey(uint8_t u, uint8_t mods) {
     case 0x28: case 0x58:                                                       // Enter
       if (nFiles) loadDoc(fileNames[fileSel]);
       uiMode = UI_EDIT; break;
-    case 0x29: uiMode = UI_EDIT; break;                                         // Esc
+    case 0x29: uiMode = prevMode; break;                                        // Esc
     case 0x11: newDoc(); setStatus("New document"); break;                      // N
     case 0x15:                                                                  // R
       if (nFiles) {
@@ -1087,6 +1807,167 @@ static void handleFilesKey(uint8_t u, uint8_t mods) {
   }
 }
 
+static void wifiOff(void);
+
+static void lockNow(void) {
+  if (docDirty) saveDoc();
+  if (wifiState != WF_OFF) { wifiOff(); if (uiMode == UI_XFER) uiMode = UI_DESK; }
+  locked = true;
+  inLen = 0; inBuf[0] = 0;
+  if (uiMode == UI_INPUT || uiMode == UI_SETTINGS) uiMode = UI_DESK;
+  requestRender();
+}
+
+// ASCII-only line entry used by the password dialogs and the lock screen
+static void inputKey(uint8_t u, uint8_t mods) {
+  bool shift = mods & 0x22;
+  bool altgr = (mods & 0x40) || ((mods & 0x01) && (mods & 0x04));
+  if (u == 0x2A) { if (inLen) inBuf[--inLen] = 0; return; }
+  uint8_t c = translate(u, shift, altgr);
+  if (c == DK_GRAVE) c = '`';
+  if (c == DK_CIRC)  c = '^';
+  if (c >= 0x20 && c <= 0x7E && inLen < sizeof(inBuf) - 1) { inBuf[inLen++] = c; inBuf[inLen] = 0; }
+}
+
+static void clearInput(void) { memset(inBuf, 0, sizeof(inBuf)); inLen = 0; }
+
+static void handleLockKey(uint8_t u, uint8_t mods) {
+  if (millis() < lockUntil) return;
+  if (u == 0x28 || u == 0x58) {
+    if (pwCheck(inBuf)) {
+      locked = false; lockFails = 0; uiMode = UI_DESK;
+      DBG("[LOCK] unlocked\n");
+    } else {
+      lockFails++;
+      if (lockFails >= 5) lockUntil = millis() + 30000UL * (lockFails - 4);
+      DBG("[LOCK] wrong password (%u)\n", lockFails);
+    }
+    clearInput();
+    return;
+  }
+  if (u == 0x29) { clearInput(); return; }
+  inputKey(u, mods);
+}
+
+static void handleInputKey(uint8_t u, uint8_t mods) {
+  if (u == 0x29) { clearInput(); memset(pwFirst, 0, sizeof(pwFirst)); uiMode = UI_SETTINGS; return; }
+  if (!(u == 0x28 || u == 0x58)) { inputKey(u, mods); return; }
+  switch (inPurpose) {
+    case IN_PW_OLD:
+      if (!pwCheck(inBuf)) { setStatus("Wrong password"); clearInput(); uiMode = UI_SETTINGS; return; }
+      inPurpose = IN_PW_NEW1; break;
+    case IN_PW_NEW1:
+      if (!inLen) { pwClear(); autoLockMin = 0; prefs.putUChar("alock", 0);
+                    setStatus("Password removed"); uiMode = UI_SETTINGS; break; }
+      if (inLen < PW_MIN_LEN) { setStatus("Password too short"); break; }
+      strlcpy(pwFirst, inBuf, sizeof(pwFirst)); inPurpose = IN_PW_NEW2; break;
+    case IN_PW_NEW2:
+      if (strcmp(pwFirst, inBuf)) { setStatus("Passwords do not match"); inPurpose = IN_PW_NEW1; }
+      else { pwStore(inBuf); setStatus("Password set"); uiMode = UI_SETTINGS; }
+      memset(pwFirst, 0, sizeof(pwFirst));
+      break;
+  }
+  clearInput();
+}
+
+static void newDoc(void);
+static void startFiles(void);
+static void toggleWiFi(void);
+
+static void deskActivate(uint8_t i) {
+  switch (i) {
+    case 0: uiMode = UI_EDIT; break;
+    case 1: newDoc(); setStatus("New document"); break;
+    case 2: startFiles(); break;
+    case 3: prevMode = UI_DESK; toggleWiFi(); break;
+    case 4: setSel = 0; setConfirm = false; uiMode = UI_SETTINGS; break;
+    case 5: prevMode = UI_DESK; uiMode = UI_HELP; break;
+    case 6: if (pwIsSet()) lockNow(); break;
+  }
+}
+
+static void handleDeskKey(uint8_t u) {
+  uint8_t n = deskCount();
+  if (deskSel >= n) deskSel = 0;
+  if (u == 0x52) deskSel = deskSel ? deskSel - 1 : n - 1;
+  else if (u == 0x51) deskSel = (deskSel + 1) % n;
+  else if (u == 0x28 || u == 0x58) deskActivate(deskSel);
+  else if (u >= 0x1E && u < 0x1E + n) { deskSel = u - 0x1E; deskActivate(deskSel); }   // digits 1..n
+}
+
+// Switch the document volume (internal flash <-> SD card)
+static void switchVolume(bool toSD) {
+  if (toSD && !sdMounted) { setStatus("No SD card"); return; }
+  if (docDirty) saveDoc();
+  docFS = toSD ? (fs::FS *)&SD : (fs::FS *)&LittleFS;
+  prefs.putUChar("vol", toSD ? 1 : 0);
+  String last = prefs.getString(prefDocKey(), "");
+  if (last.length() && docFS->exists("/docs/" + last)) loadDoc(last.c_str());
+  else {
+    listFiles();
+    if (nFiles) loadDoc(fileNames[0]);
+    else { uint8_t m = uiMode; newDoc(); uiMode = m; }
+  }
+  listFiles();
+  setStatus(toSD ? "Now using the SD card" : "Now using internal flash");
+}
+
+// Copy every document of the active volume to the other one (existing files are kept)
+static void copyAllDocs(void) {
+  if (!sdMounted) { setStatus("No SD card"); return; }
+  if (docDirty) saveDoc();
+  fs::FS &src = *docFS;
+  fs::FS &dst = volIsSD() ? (fs::FS &)LittleFS : (fs::FS &)SD;
+  if (!dst.exists("/docs")) dst.mkdir("/docs");
+  unsigned copied = 0, skipped = 0;
+  File d = src.open("/docs");
+  File e;
+  static uint8_t buf[2048];
+  while (d && (e = d.openNextFile())) {
+    const char *nm = e.name();
+    const char *b = strrchr(nm, '/'); b = b ? b + 1 : nm;
+    if (b[0] == '.') { e.close(); continue; }
+    String p = String("/docs/") + b;
+    if (dst.exists(p)) { skipped++; e.close(); continue; }
+    File o = dst.open(p, "w");
+    if (o) { size_t n; while ((n = e.read(buf, sizeof(buf))) > 0) o.write(buf, n); o.close(); copied++; }
+    e.close();
+  }
+  if (d) d.close();
+  char m[64]; snprintf(m, sizeof(m), "Copied %u, skipped %u (already there)", copied, skipped);
+  setStatus(m, 5000);
+}
+
+static void handleSettingsKey(uint8_t u) {
+  if (setConfirm) {
+    setConfirm = false;
+    if (u == 0x1C) { reqUnpair = true; setStatus("Pairing deleted"); }              // Y
+    return;
+  }
+  switch (u) {
+    case 0x29: uiMode = UI_DESK; return;                                             // Esc
+    case 0x52: setSel = setSel ? setSel - 1 : 6; return;
+    case 0x51: setSel = (setSel + 1) % 7; return;
+    case 0x28: case 0x58: break;
+    default: return;
+  }
+  switch (setSel) {
+    case 0: clearInput(); inPurpose = pwIsSet() ? IN_PW_OLD : IN_PW_NEW1; uiMode = UI_INPUT; break;
+    case 1:
+      if (!pwIsSet()) { setStatus("Set a password first"); break; }
+      autoLockMin = autoLockMin == 0 ? 5 : autoLockMin == 5 ? 15 : autoLockMin == 15 ? 30 : 0;
+      prefs.putUChar("alock", autoLockMin); break;
+    case 2: kbdLayout = (kbdLayout + 1) % 3; prefs.putUChar("layout", kbdLayout); break;
+    case 3: switchVolume(!volIsSD()); break;
+    case 4: copyAllDocs(); break;
+    case 5:
+      wallMode = (wallMode + 1) % 3; prefs.putUChar("wall", wallMode);
+      if (wallMode == WALL_FILE) loadWallpaper();
+      break;
+    case 6: setConfirm = true; break;
+  }
+}
+
 static void handlePress(uint8_t u, uint8_t mods, bool repeat) {
   bool ctrl  = mods & 0x11;
   bool shift = mods & 0x22;
@@ -1095,7 +1976,12 @@ static void handlePress(uint8_t u, uint8_t mods, bool repeat) {
 
   if (u == 0x39) { if (!repeat) capsLock = !capsLock; requestRender(); return; }
 
-  if (uiMode == UI_HELP) { if (!repeat) uiMode = UI_EDIT; requestRender(); return; }
+  if (locked)                { if (!repeat) handleLockKey(u, mods); requestRender(); return; }
+  if (uiMode == UI_DESK)     { if (!repeat) handleDeskKey(u); requestRender(); return; }
+  if (uiMode == UI_SETTINGS) { if (!repeat) handleSettingsKey(u); requestRender(); return; }
+  if (uiMode == UI_INPUT)    { handleInputKey(u, mods); requestRender(); return; }
+  if (uiMode == UI_HELP) { if (!repeat) uiMode = prevMode; requestRender(); return; }
+  if (uiMode == UI_PREVIEW)  { handlePreviewKey(u, ctrl); requestRender(); return; }
   if (uiMode == UI_FILES) { handleFilesKey(u, mods); requestRender(); return; }
   if (uiMode == UI_XFER) {                                   // transfer screen: only exit keys
     if (!repeat && (u == 0x29 || (ctrl && u == 0x1A))) toggleWiFi();
@@ -1109,8 +1995,10 @@ static void handlePress(uint8_t u, uint8_t mods, bool repeat) {
       case 0x16: setStatus(saveDoc() ? "Saved" : "ERROR saving"); break;  // S
       case 0x12: startFiles(); break;                                              // O
       case 0x11: newDoc(); setStatus("New document"); break;                       // N
-      case 0x0B: uiMode = UI_HELP; break;                                          // H
-      case 0x1A: toggleWiFi(); break;                                              // W
+      case 0x0B: prevMode = uiMode; uiMode = UI_HELP; break;                       // H
+      case 0x0F: if (pwIsSet()) lockNow(); break;                                  // L
+      case 0x13: startPreview(); break;                                            // P
+      case 0x1A: prevMode = uiMode; toggleWiFi(); break;                           // W
       case 0x15: cleanRequest = true; break;                                       // R
       case 0x4A: case 0x4D:                                                        // Ctrl+Home/End
         xSemaphoreTake(docMutex, portMAX_DELAY);
@@ -1132,7 +2020,13 @@ static void handlePress(uint8_t u, uint8_t mods, bool repeat) {
       break;
     case 0x4C: if (cursorPos < len) { docDelete(cursorPos); docDirty = true; } break;  // Delete
     case 0x2B: for (int i = 0; i < TAB_SPACES; i++) editInsert(' '); break;
-    case 0x29: deadKey = 0; break;                                 // Esc
+    case 0x29:                                                     // Esc
+      if (deadKey) { deadKey = 0; break; }
+      xSemaphoreGive(docMutex);
+      if (docDirty) saveDoc();
+      uiMode = UI_DESK;
+      requestRender();
+      return;
     case 0x4F: if (cursorPos < len) cursorPos++; break;            // right
     case 0x50: if (cursorPos) cursorPos--; break;                  // left
     case 0x51: moveVertical(+1); vertical = true; break;           // down
@@ -1174,6 +2068,7 @@ static bool repeatable(uint8_t u) {
 
 static void processKeys(void) {
   key_evt_t e;
+  if (kbLost) { kbLost = false; heldUsage = 0; }
   while (xQueueReceive(qKeys, &e, 0) == pdTRUE) {
     lastInputMs = millis();
     if (e.type) {
@@ -1330,11 +2225,23 @@ static void onBattNotify(NimBLERemoteCharacteristic *, uint8_t *d, size_t n, boo
 /*===========================================================================
  *  SECTION 12 - BLE CENTRAL (HOGP host)
  *=========================================================================*/
+/* BLE state shown to the user. While a keyboard is bonded, only "linked" vs
+ * "not linked" is visible, so scan/connect retries must not redraw the panel:
+ * with the keyboard switched to another host (K380s Easy-Switch) the retry
+ * loop would otherwise refresh the E-Paper every few seconds. */
+static void setBleState(uint8_t s) {
+  uint8_t old = bleState;
+  bleState = s;
+  bool visibleChange = (numBonds == 0) ? (old != s) : ((old == BLE_READY) != (s == BLE_READY));
+  if (visibleChange) requestRender();
+}
+
 class ClientCB : public NimBLEClientCallbacks {
   void onDisconnect(NimBLEClient *, int reason) override {
     DBG("[BLE] disconnected, reason=%d\n", reason);
-    bleState = BLE_IDLE; passkeyActive = false;
-    requestRender();
+    passkeyActive = false;
+    kbLost = true;
+    setBleState(BLE_IDLE);
   }
   void onConfirmPasskey(NimBLEConnInfo &ci, uint32_t) override {
     NimBLEDevice::injectConfirmPasskey(ci, true);    // should not happen with DisplayOnly
@@ -1462,16 +2369,22 @@ static void bleTask(void *) {
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&scb, false);
   scan->setActiveScan(true);                 // the scan response carries the name
+  // 30 % duty cycle (window 30 ms every 100 ms). A 100 % BLE scan leaves almost
+  // no airtime to WiFi on the shared 2.4 GHz radio; keyboards advertise every
+  // few tens of ms when reconnecting, so 30 % still finds them quickly.
   scan->setInterval(100);
-  scan->setWindow(100);
+  scan->setWindow(30);
 
   NimBLEClient *cl = NimBLEDevice::createClient();
   cl->setClientCallbacks(&ccb, false);
-  cl->setConnectionParams(6, 24, 0, 400);    // 7.5-30 ms, latency 0, timeout 4 s
+  // 7.5-30 ms, latency 0, timeout 4 s; connection-initiation scan 30 ms every 100 ms
+  cl->setConnectionParams(6, 24, 0, 400, 160, 48);
   cl->setConnectTimeout(5000);
+  bool relaxed = false;
 
   for (;;) {
-    numBonds = NimBLEDevice::getNumBonds();
+    int nb = NimBLEDevice::getNumBonds();
+    if (nb != numBonds) { numBonds = nb; requestRender(); }
     if (reqUnpair) {
       reqUnpair = false;
       if (cl->isConnected()) cl->disconnect();
@@ -1480,14 +2393,32 @@ static void bleTask(void *) {
       DBG("[BLE] bonds deleted\n");
       requestRender();
     }
-    if (cl->isConnected()) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+    bool wifiOn = (wifiState != WF_OFF);
+    if (cl->isConnected()) {
+      // During file transfer ask the keyboard for a relaxed link (30-50 ms,
+      // slave latency 4) so WiFi gets more airtime; restore it afterwards.
+      if (wifiOn && !relaxed) {
+        relaxed = true;
+        DBG("[BLE] relaxed conn params for WiFi: %d\n", cl->updateConnParams(24, 40, 4, 600));
+      } else if (!wifiOn && relaxed) {
+        relaxed = false;
+        DBG("[BLE] normal conn params: %d\n", cl->updateConnParams(6, 24, 0, 400));
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+    relaxed = false;
+    // No keyboard and WiFi on: do not scan or initiate at all, the radio is
+    // left entirely to the hotspot until the transfer is closed.
+    if (wifiOn) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
 
     // 1) Scan in 5 s windows
-    bleState = BLE_SCAN;
+    setBleState(BLE_SCAN);
     candFound = false;
     scan->start(5000, false, true);
     uint32_t t0 = millis();
-    while (!candFound && millis() - t0 < 5200 && !reqUnpair) vTaskDelay(pdMS_TO_TICKS(50));
+    while (!candFound && millis() - t0 < 5200 && !reqUnpair && wifiState == WF_OFF) vTaskDelay(pdMS_TO_TICKS(50));
+    if (wifiState != WF_OFF && !candFound) { if (scan->isScanning()) scan->stop(); continue; }
     if (scan->isScanning()) scan->stop();
 
     NimBLEAddress target;
@@ -1498,23 +2429,23 @@ static void bleTask(void *) {
       DBG("[BLE] direct attempt to %s\n", target.toString().c_str());
     } else continue;
 
-    bleState = BLE_CONNECTING; requestRender();
-    if (!cl->connect(target, true)) { bleState = BLE_IDLE; requestRender(); continue; }
+    setBleState(BLE_CONNECTING);
+    if (!cl->connect(target, true)) { setBleState(BLE_IDLE); continue; }
     DBG("[BLE] connected to %s, securing link...\n", target.toString().c_str());
 
     if (!secureLink(cl)) {
       DBG("[BLE] security failure\n");
       if (cl->isConnected()) cl->disconnect();
-      bleState = BLE_IDLE; requestRender();
+      setBleState(BLE_IDLE);
       continue;
     }
     if (!setupHid(cl)) {
       DBG("[BLE] no keyboard report found\n");
-      cl->disconnect(); bleState = BLE_IDLE; requestRender();
+      cl->disconnect(); setBleState(BLE_IDLE);
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
-    bleState = BLE_READY;
+    setBleState(BLE_READY);
     setStatus("Keyboard connected");
   }
 }
@@ -1539,23 +2470,40 @@ static void webRoot(void) {
                "h2{background:#222;color:#f4f1ea;padding:.4em .6em;font-weight:normal}"
                "table{width:100%;border-collapse:collapse}td{padding:6px 10px;border-bottom:1px solid #ccc}"
                "a{color:#222}</style></head><body>"
-               "<h2>ELECTGPL WRITER</h2><table>");
+               "<h2>ELECTGPL WRITER</h2>");
+  h += "<p>Storage: " + String(volName()) + "</p><table>";
   for (uint8_t i = 0; i < nFiles; i++) {
     h += "<tr><td>" + String(fileNames[i]) + "</td><td>" + String(fileSizes[i]) +
          " B</td><td><a href='/dl?f=" + fileNames[i] +
          "'>download</a></td><td><a href='/del?f=" + fileNames[i] +
          "' onclick=\"return confirm('Delete?')\">delete</a></td></tr>";
   }
-  h += F("</table><h3>Upload .txt / .md</h3><form method='POST' action='/up' "
-         "enctype='multipart/form-data'><input type='file' name='f'> "
-         "<input type='submit' value='Upload'></form></body></html>");
+  h += F("</table>"
+         "<h3>Upload a note (.txt / .md)</h3><input type='file' id='fd' accept='.txt,.md'> "
+         "<button onclick=\"up('doc','fd')\">Upload note</button>"
+         "<h3>Wallpaper (.bmp, 792x272 recommended)</h3><input type='file' id='fw' accept='.bmp'> "
+         "<button onclick=\"up('wall','fw')\">Upload wallpaper</button>"
+         "<p><progress id='p' max='100' value='0' style='width:100%'></progress><br><span id='s'></span></p>"
+         "<script>"
+         "function up(k,id){var i=document.getElementById(id),s=document.getElementById('s'),"
+         "p=document.getElementById('p');if(!i.files.length){s.textContent='Choose a file first';return;}"
+         "var f=i.files[0],x=new XMLHttpRequest();"
+         "x.open('POST','/upload');"
+         "x.setRequestHeader('Content-Type','application/octet-stream');"
+         "x.setRequestHeader('X-Kind',k);x.setRequestHeader('X-Name',encodeURIComponent(f.name));"
+         "x.upload.onprogress=function(e){if(e.lengthComputable){p.value=100*e.loaded/e.total;"
+         "s.textContent='Uploading '+f.name+': '+Math.round(100*e.loaded/e.total)+' %';}};"
+         "x.onload=function(){s.textContent=x.responseText;if(x.status==200)setTimeout(function(){location.reload();},1500);};"
+         "x.onerror=function(){s.textContent='Network error: no answer from the device';};"
+         "s.textContent='Uploading '+f.name+'...';x.send(f);}"
+         "</script></body></html>");
   server.send(200, "text/html; charset=utf-8", h);
 }
 
 static void webDownload(void) {
   String n = server.arg("f");
   if (!safeName(n)) { server.send(400, "text/plain", "invalid name"); return; }
-  File f = LittleFS.open("/docs/" + n, "r");
+  File f = docFS->open("/docs/" + n, "r");
   if (!f) { server.send(404, "text/plain", "not found"); return; }
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + n + "\"");
   server.streamFile(f, "text/plain; charset=utf-8");
@@ -1564,23 +2512,56 @@ static void webDownload(void) {
 
 static void webDelete(void) {
   String n = server.arg("f");
-  if (safeName(n) && n != docName) LittleFS.remove("/docs/" + n);
+  if (safeName(n) && n != docName) docFS->remove("/docs/" + n);
   server.sendHeader("Location", "/"); server.send(303);
 }
 
-static void webUpload(void) {
-  HTTPUpload &up = server.upload();
-  if (up.status == UPLOAD_FILE_START) {
-    String n = up.filename;
-    upFile = safeName(n) && n != docName ? LittleFS.open("/docs/" + n, "w") : File();
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (upFile) upFile.write(up.buf, up.currentSize);
-  } else if (up.status == UPLOAD_FILE_END) {
+/* Uploads arrive as a raw request body (application/octet-stream) sent by the
+ * page's JavaScript, with the file name in the X-Name header. This avoids the
+ * multipart/form-data parser and lets the browser show real upload progress. */
+static void webUploadRaw(void) {
+  HTTPRaw &r = server.raw();
+  if (r.status == RAW_START) {
+    upBytes = 0; upOk = false; upMsg[0] = 0;
+    upIsWall = server.header("X-Kind") == "wall";
+    String n = server.header("X-Name");               // encodeURIComponent keeps [A-Za-z0-9._-]
+    strlcpy(upName, n.c_str(), sizeof(upName));
+    if (upIsWall) upFile = docFS->open(WALL_FILE_PATH, "w");
+    else if (safeName(n) && n != docName) upFile = docFS->open("/docs/" + n, "w");
+    else upFile = File();
+    DBG("[WEB] upload start '%s' (%s) -> %s\n", upName, upIsWall ? "wallpaper" : "note",
+        upFile ? "open" : "REJECTED");
+  } else if (r.status == RAW_WRITE) {
+    if (upFile && upFile.write(r.buf, r.currentSize) != r.currentSize) {
+      upFile.close(); upFile = File();                 // storage full or write error
+      snprintf(upMsg, sizeof(upMsg), "ERROR writing %s (storage full?)", upName);
+    }
+    upBytes += r.currentSize;
+  } else if (r.status == RAW_END) {
+    if (upFile) { upFile.close(); upOk = true; }
+    DBG("[WEB] upload end '%s' %lu B %s\n", upName, (unsigned long)upBytes, upOk ? "OK" : "FAILED");
+  } else if (r.status == RAW_ABORTED) {
     if (upFile) upFile.close();
+    upOk = false;
+    DBG("[WEB] upload aborted '%s' after %lu B\n", upName, (unsigned long)upBytes);
   }
 }
 
-/* WiFi and BLE run at the same time: the ESP32-S3 has a single 2.4 GHz radio
+static void webUploadDone(void) {
+  char sz[16]; fmtSize(upBytes, sz, sizeof(sz));
+  if (upOk) {
+    snprintf(upMsg, sizeof(upMsg), "OK: %s (%s)%s", upName, sz, upIsWall ? " set as wallpaper" : "");
+    if (upIsWall) { wallMode = WALL_FILE; prefs.putUChar("wall", wallMode); wallReload = true; }
+    server.send(200, "text/plain", upMsg);
+  } else {
+    if (!upMsg[0] || strncmp(upMsg, "ERROR", 5))
+      snprintf(upMsg, sizeof(upMsg), "ERROR: %s rejected (name: a-z 0-9 . _ - , .txt/.md) or incomplete", upName);
+    server.send(400, "text/plain", upMsg);
+  }
+  requestRender();                                      // show the result on the device too
+}
+
+/* WiFi and BLE run at the same time/* WiFi and BLE run at the same time: the ESP32-S3 has a single 2.4 GHz radio
  * and ESP-IDF time-shares it (software coexistence, CONFIG_ESP_COEX_SW_COEXIST
  * _ENABLE=1 in the arduino-esp32 libs). Rule: never call WiFi.setSleep(false)
  * while BLE is up; with coexistence WiFi must stay in modem-sleep.
@@ -1643,7 +2624,7 @@ static void wifiOff(void) {
 static void toggleWiFi(void) {
   if (uiMode == UI_XFER) {                                 // close transfer mode
     wifiOff();
-    uiMode = UI_EDIT;
+    uiMode = (prevMode == UI_XFER) ? (uint8_t)UI_DESK : prevMode;
     listFiles();
     setStatus("WiFi off");
     return;
@@ -1686,12 +2667,15 @@ static void handleButtons(void) {
     if (v == HIGH && last[i] == LOW) {
       uint32_t held = millis() - tDown[i];
       switch (pins[i]) {
-        case BTN_UP:   handlePress(0x4B, 0, false); break;
-        case BTN_DOWN: handlePress(0x4E, 0, false); break;
-        case BTN_OK:   setStatus(saveDoc() ? "Saved" : "ERROR saving"); break;
+        case BTN_UP:   if (!locked && uiMode == UI_EDIT) handlePress(0x4B, 0, false); break;
+        case BTN_DOWN: if (!locked && uiMode == UI_EDIT) handlePress(0x4E, 0, false); break;
+        case BTN_OK:   if (!locked) setStatus(saveDoc() ? "Saved" : "ERROR saving"); break;
         case BTN_MENU: cleanRequest = true; requestRender(); break;
         case BTN_EXIT:
           if (held >= 3000) { reqUnpair = true; setStatus("Pairing deleted"); }
+          else if (!locked && uiMode != UI_DESK) { if (docDirty) saveDoc();
+                                                   if (uiMode == UI_XFER) wifiOff();
+                                                   uiMode = UI_DESK; requestRender(); }
           break;
       }
     }
@@ -1731,12 +2715,24 @@ void setup() {
 
   if (!LittleFS.begin(true)) DBG("[FS] ERROR mounting LittleFS\n");
   if (!LittleFS.exists("/docs")) LittleFS.mkdir("/docs");
+  mountSD();
 
   prefs.begin("writer", false);
-  String last = prefs.getString("doc", "");
-  if (last.length() && LittleFS.exists("/docs/" + last)) {
+  kbdLayout   = prefs.getUChar("layout", KBD_LAYOUT) % 3;
+  wallMode    = prefs.getUChar("wall", WALL_BUILTIN) % 3;
+  autoLockMin = prefs.getUChar("alock", 0);
+  // Password recovery: hold MENU + EXIT while powering up (privacy lock, not encryption)
+  if (digitalRead(BTN_MENU) == LOW && digitalRead(BTN_EXIT) == LOW && pwIsSet()) {
+    pwClear(); autoLockMin = 0; prefs.putUChar("alock", 0);
+    DBG("[LOCK] password cleared by button recovery\n");
+  }
+  wallBuf = (uint8_t *)ps_malloc(SCR_W / 8 * SCR_H);
+  loadWallpaper();
+  docFS = (sdMounted && prefs.getUChar("vol", 0) == 1) ? (fs::FS *)&SD : (fs::FS *)&LittleFS;
+  String last = prefs.getString(prefDocKey(), "");
+  if (last.length() && docFS->exists("/docs/" + last)) {
     loadDoc(last.c_str());
-    uint32_t c = prefs.getUInt("cur", docLen());
+    uint32_t c = prefs.getUInt(prefCurKey(), docLen());
     cursorPos = c > docLen() ? docLen() : c;
     fixViewport();
   } else {
@@ -1748,13 +2744,18 @@ void setup() {
   server.on("/", HTTP_GET, webRoot);
   server.on("/dl", HTTP_GET, webDownload);
   server.on("/del", HTTP_GET, webDelete);
-  server.on("/up", HTTP_POST, []() { server.sendHeader("Location", "/"); server.send(303); }, webUpload);
+  server.on("/upload", HTTP_POST, webUploadDone, webUploadRaw);
+  static const char *hdrKeys[] = { "X-Name", "X-Kind" };
+  server.collectHeaders(hdrKeys, 2);
 
   NimBLEDevice::init("Electgpl-Writer");
   NimBLEDevice::setSecurityAuth(true, true, true);          // bonding, MITM, LE SC
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);   // we display the passkey
+  numBonds = NimBLEDevice::getNumBonds();   // known before the first frame: no false pairing screen
 
   if (!psramFound()) setStatus("NO PSRAM: Tools > PSRAM > OPI PSRAM", 60000);
+  uiMode = UI_DESK;
+  locked = pwIsSet();
   lastInputMs = millis();
   xTaskCreatePinnedToCore(displayTask, "epd", 8192, NULL, 2, &dispTaskH, 1);
   xTaskCreatePinnedToCore(bleTask,     "ble", 8192, NULL, 3, NULL, 0);
@@ -1772,6 +2773,14 @@ void loop() {
   wifiPoll();
 
   if (docDirty && (millis() - lastInputMs) > AUTOSAVE_MS) saveDoc();
+
+  if (!locked && autoLockMin && pwIsSet() &&
+      millis() - lastInputMs > (uint32_t)autoLockMin * 60000UL) { DBG("[LOCK] auto-lock\n"); lockNow(); }
+
+  if (wallReload) { wallReload = false; loadWallpaper(); requestRender(); }
+
+  static uint32_t lockTick = 0;                           // countdown on the lock screen
+  if (locked && millis() < lockUntil + 1000 && millis() - lockTick > 1000) { lockTick = millis(); requestRender(); }
 
   static bool statusShown = false;                        // redraw when the status message expires
   bool active = statusMsg[0] && millis() < statusUntil;
