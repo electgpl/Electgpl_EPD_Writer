@@ -12,7 +12,8 @@ A distraction-free writing device in the spirit of the Zerowriter Ink / Freewrit
 - **PDA-style desktop** at boot: a menu over a wallpaper (built-in Smith chart, or your own BMP) with *Continue writing*, *New document*, *Documents*, *File transfer*, *Settings*, *Help* and *Lock*.
 - **microSD card support** (FAT): documents can live on the card or in internal flash, selectable in Settings, with a one-key copy of all documents between the two.
 - **Markdown preview** (Ctrl+P): a read-only rendered view of the document with headings, bold, italic, strikethrough, inline and fenced code, lists, quotes, links, tables and rules.
-- **Privacy lock**: optional password (salted, iterated SHA-256 in NVS) with auto-lock after 5/15/30 minutes idle.
+- **Keyboard-less "pocket PDA" mode**: the side buttons (UP/DOWN/OK, EXIT, MENU and BOOT) navigate the desktop, the file list and a read-only viewer, so documents can be read without the keyboard.
+- **Private documents** (Casio organizer style): documents marked private are hidden until the password is entered; public ones never ask for it. Auto-hide after 5/15/30 minutes idle.
 - **Typewriter-style editor** on a 792 × 272 E-Paper panel: 64 columns × 10 lines, soft word-wrap, block cursor, half-page scroll jumps and a scroll bar.
 - **BLE keyboard host (HOGP)** implemented on the ESP32-S3. The Report Map is parsed, so 6KRO and NKRO keyboards both work, with Boot Protocol as fallback. Pairing uses **LE Secure Connections with Passkey Entry**: the 6-digit code is shown on the E-Paper and typed on the keyboard. Keyboard battery level appears in the status bar.
 - **Spanish (Latin America), Spanish (Spain) and US layouts**, with dead keys (´ ¨ ` ^), AltGr and Caps Lock. The full ISO-8859-1 character set is available (á é í ó ú ñ ü ¿ ¡ …).
@@ -30,14 +31,16 @@ A distraction-free writing device in the spirit of the Zerowriter Ink / Freewrit
 | Editor | Editor with Spanish text (Latin-1 font) |
 | ![Settings](docs/img/settings.png) | ![Custom wallpaper](docs/img/desktop_custom.png) |
 | Settings | Desktop with a user BMP wallpaper (Floyd-Steinberg dithered) |
-| ![Lock](docs/img/lock.png) | ![Password](docs/img/password.png) |
-| Lock screen | Setting a password |
+| ![Files with private documents](docs/img/files.png) | ![Unlock](docs/img/unlock.png) |
+| File list with private `[P]` documents | Unlocking the private documents |
+| ![Plain text viewer](docs/img/view_txt.png) | ![Password](docs/img/password.png) |
+| Read-only viewer (.txt), side buttons | Setting a password |
 | ![Help](docs/img/help.png) | ![Transfer](docs/img/transfer.png) |
 | Help screen (Ctrl+H) | File transfer mode (Ctrl+W) |
-| ![Pairing](docs/img/pairing_passkey.png) | ![Searching](docs/img/pairing_search.png) |
-| BLE pairing: passkey shown on the E-Paper | Waiting for a keyboard in pairing mode |
-| ![Files](docs/img/files.png) | ![Rename](docs/img/files_rename.png) |
-| File list (Ctrl+O) | Renaming a file in place |
+| ![Pairing](docs/img/pairing_passkey.png) | |
+| BLE pairing: passkey shown on the E-Paper | |
+| ![Pairing search](docs/img/pairing_search.png) | ![Rename](docs/img/files_rename.png) |
+| Waiting for a keyboard (any side button skips it) | Renaming a file in place |
 | ![Markdown preview](docs/img/md_preview.png) | ![Markdown preview, page 2](docs/img/md_preview2.png) |
 | Markdown preview (Ctrl+P) | Lists, links, quotes and headings |
 | ![Web page](docs/img/web_page.png) | |
@@ -99,26 +102,43 @@ The bond is stored in NVS and later reconnections are automatic. To pair again, 
 
 ### Desktop
 
-The device boots into the desktop. Move with the arrows and press Enter, or press the item number (1–7). **Esc** in the editor, or a short press of the **EXIT** button, returns to the desktop (the document is saved first).
+The device boots into the desktop. Move with the arrows and press Enter, press the item number (1–7), or use the side buttons. **Esc** in the editor, or **EXIT** / **BOOT**, returns to the desktop (the document is saved first). Without a keyboard, item 1 becomes *Read document*.
 
 ### Settings
 
 | Item | Enter does |
 |---|---|
 | Password | Set, change or remove it (empty new password = remove). Minimum 4 characters. |
-| Auto-lock | Cycles Off / 5 / 15 / 30 min (needs a password) |
+| Auto-hide priv. | Hides private documents after Off / 5 / 15 / 30 min idle (needs a password) |
 | Keyboard layout | Cycles Latin America / Spain / US |
 | Storage | Switches between internal flash and the microSD card |
 | Copy documents | Copies every document to the other volume (files that already exist there are kept) |
 | Wallpaper | Cycles Built-in / File `/wallpaper.bmp` / None |
-| Forget keyboard | Deletes the BLE bond (confirm with Y) |
+| Forget keyboard | Deletes the BLE bond (confirm with Y or OK) |
 
-### Password lock
+### Private documents
 
-- The device starts locked when a password is set; **Ctrl+L** or the *Lock* item locks it at any time.
+Like the "secret" area of Casio electronic organizers, the password protects only the documents you choose; the device itself never asks for it at power-up.
+
+- Set a password in **Settings → Password**. In the file list, **P** moves the selected document to the private folder (`/secret`) or back to `/docs`. Private entries are marked `[P]`.
+- Private documents are only listed (on the device and on the transfer web page) after desktop item **7 Private: unlock** and the password. **Ctrl+L**, item 7 again (*Private: lock*) or the auto-hide timer hides them; an open private document is closed first.
+- A private document is never reopened automatically at power-up.
 - After 5 wrong attempts, input is blocked for 30 s, growing with every further failure.
-- This is a **privacy lock, not encryption**: the documents are stored in clear text in flash or on the SD card.
-- **Recovery:** hold **MENU + EXIT** while powering up to clear the password.
+- This is a **privacy feature, not encryption**: files are stored in clear text in flash or on the SD card.
+- **Recovery:** hold **MENU + EXIT** while powering up to clear the password (private documents then become visible).
+
+### Side buttons (keyboard-less use)
+
+| Button | Lists, desktop, settings | Editor / viewer |
+|---|---|---|
+| UP / DOWN | Move the selection (auto-repeat when held) | Page up / down |
+| OK | Select (Enter) | Editor: save · Viewer: next page |
+| EXIT | Back (Esc) | Back |
+| BOOT | Desktop | Desktop |
+| MENU | Full refresh (clears ghosting) | Full refresh |
+| EXIT held 3 s | Forget the bonded keyboard | |
+
+Documents opened with a button, or while no keyboard is linked, open in the **read-only viewer**: Markdown files are rendered, other files are shown as plain text with their line breaks and indentation. If no keyboard has ever been paired, any side button skips the pairing screen. Items that need typing (new document, password) ask for the keyboard.
 
 ### Markdown preview (Ctrl+P)
 
@@ -153,8 +173,8 @@ Upload any uncompressed BMP (1/4/8/24/32 bpp) from the transfer web page, or cop
 | Ctrl+W | File transfer mode (Wi-Fi hotspot) on/off |
 | Ctrl+R | Full refresh (clears ghosting) |
 | Ctrl+H | Help screen |
-| Ctrl+L | Lock (if a password is set) |
-| Ctrl+P | Markdown preview (read-only) |
+| Ctrl+L | Hide private documents |
+| Ctrl+P | Markdown preview / plain-text viewer (read-only) |
 | Esc | Desktop (or cancel a pending dead key) |
 | Ctrl+Home / Ctrl+End | Start / end of document |
 | Arrows, Home, End, PgUp, PgDn | Navigation |
@@ -172,15 +192,6 @@ Upload any uncompressed BMP (1/4/8/24/32 bpp) from the transfer web page, or cop
 
 The footer shows the size of the open document against its limit, and the flash used against the total.
 
-### Board buttons
-
-| Button | Action |
-|---|---|
-| EXIT (short press) | Desktop |
-| MENU | Full refresh |
-| OK | Save |
-| UP / DOWN | Page up / down |
-| EXIT (held 3 s) | Forget the bonded keyboard |
 
 ### File transfer (Ctrl+W)
 
@@ -298,7 +309,7 @@ The keyboard layout, storage volume, wallpaper, auto-lock and password are runti
 | Upload page says *Network error*, transfer screen shows *PCs connected: 0* | The PC left the hotspot (Windows may jump back to a known network when the link degrades). Rejoin `Electgpl-Writer`. Firmware before this fix scanned BLE at 100 % duty while the keyboard was away, starving Wi-Fi. |
 | Browser shows `ERR_EMPTY_RESPONSE` after an upload | Older firmware used multipart uploads; update. If it persists, set *Tools → Core Debug Level → Error* and check the `[WEB]` and WebServer lines in the serial log. |
 | Settings shows *(no SD card)* | The card is only mounted at boot: insert it (FAT32) and restart. |
-| Forgot the password | Hold MENU + EXIT while powering up. |
+| Forgot the password | Hold MENU + EXIT while powering up (private documents become visible). |
 
 ## Repository layout
 
